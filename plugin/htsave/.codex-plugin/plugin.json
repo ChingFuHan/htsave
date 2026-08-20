@@ -1,0 +1,19 @@
+{
+  "name": "htsave",
+  "version": "1.0.0",
+  "description": "Lossless repeated-context saving for Codex CLI.",
+  "author": {
+    "name": "htsave contributors"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "htsave",
+    "shortDescription": "Save repeated Codex context losslessly.",
+    "longDescription": "Deduplicate and restore repeated Codex context without semantic loss.",
+    "developerName": "htsave contributors",
+    "category": "Productivity",
+    "capabilities": ["Read"],
+    "defaultPrompt": ["Use htsave for repeated workspace context."]
+  },
+  "mcpServers": "./.mcp.json"
+}

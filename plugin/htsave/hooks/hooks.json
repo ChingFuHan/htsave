@@ -1,0 +1,107 @@
+{
+  "description": "Lossless htsave session and tool lifecycle hooks.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HTSAVE_POSIX_COMMAND__",
+            "commandWindows": "__HTSAVE_WINDOWS_COMMAND__",
+            "additionalContextLimit": 0,
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HTSAVE_POSIX_COMMAND__",
+            "commandWindows": "__HTSAVE_WINDOWS_COMMAND__",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HTSAVE_POSIX_COMMAND__",
+            "commandWindows": "__HTSAVE_WINDOWS_COMMAND__",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HTSAVE_POSIX_COMMAND__",
+            "commandWindows": "__HTSAVE_WINDOWS_COMMAND__",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HTSAVE_POSIX_COMMAND__",
+            "commandWindows": "__HTSAVE_WINDOWS_COMMAND__",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HTSAVE_POSIX_COMMAND__",
+            "commandWindows": "__HTSAVE_WINDOWS_COMMAND__",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HTSAVE_POSIX_COMMAND__",
+            "commandWindows": "__HTSAVE_WINDOWS_COMMAND__",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HTSAVE_POSIX_COMMAND__",
+            "commandWindows": "__HTSAVE_WINDOWS_COMMAND__",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

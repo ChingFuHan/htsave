@@ -1,0 +1,13 @@
+This is deterministic htsave benchmark scenario "{scenario_id}".
+
+Run these commands as separate shell tool calls, exactly in this order:
+{steps}
+
+Do not use web search, MCP tools, subagents, or alternate file-reading commands.
+After all commands finish, your entire final message must be exactly one JSON
+object matching answer.schema.json. No prose, no explanation, no code fences.
+The canonical facts to report are:
+{facts}
+
+Use this exact response shape, with no extra claims:
+{answer_example}

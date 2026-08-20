@@ -1,0 +1,17 @@
+This is deterministic htsave benchmark scenario "{scenario_id}".
+
+Perform these steps as separate tool calls, exactly in this order:
+{steps}
+
+Every file read must use the htsave_read MCP tool. If htsave_read returns an
+htsave reference line instead of file text, call htsave_hydrate with that exact
+reference before you rely on the content.
+
+Do not use web search, subagents, or any other file-reading command or tool.
+After all steps finish, your entire final message must be exactly one JSON
+object matching answer.schema.json. No prose, no explanation, no code fences.
+The canonical facts to report are:
+{facts}
+
+Use this exact response shape, with no extra claims:
+{answer_example}

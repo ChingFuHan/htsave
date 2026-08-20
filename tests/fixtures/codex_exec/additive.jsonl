@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"thread-additive","future_thread_field":{"version":2}}
+{"type":"turn.started","future_turn_field":true}
+{"type":"future.snapshot","payload":{"opaque":true}}
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"reasoning_output_tokens":2,"future_usage_field":99},"future_terminal_field":"accepted"}
