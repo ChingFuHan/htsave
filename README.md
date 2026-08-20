@@ -1,3 +1,11 @@
+<!-- Language Switch -->
+<p align="center">
+  <strong>🌐 English</strong> |
+  <a href="README.zh-TW.md">繁體中文</a>
+</p>
+
+---
+
 # htsave
 
 `htsave` 1.0.0 is a local, deterministic, lossless repeated-context layer for
