@@ -63,7 +63,7 @@ def test_source_driver_changes_exactly_three_lines_and_is_idempotent(tmp_path: P
     assert second_mutation.stdout == b"mutated_lines=0\n"
 
 
-def test_release_manifest_has_40_alternating_executions_and_fixed_argv() -> None:
+def test_release_manifest_has_80_alternating_executions_and_fixed_argv() -> None:
     manifest = build_release_manifest(
         codex_executable="fake-codex",
         payload_lines=6,
@@ -73,13 +73,13 @@ def test_release_manifest_has_40_alternating_executions_and_fixed_argv() -> None
     assert manifest.host == "codex"
     assert manifest.path == "mcp"
     assert manifest.python_executable == sys.executable
-    assert len(manifest.executions) == EXECUTION_COUNT == 40
+    assert len(manifest.executions) == EXECUTION_COUNT == 80
     assert set(manifest.fixture_digests) == set(REQUIRED_SCENARIOS)
     assert manifest.argv[0:2] == ("fake-codex", "exec")
     for required in (
         "--json",
         "--ephemeral",
-        "--ask-for-approval",
+        "--approve-for-me",
         "--add-dir",
         "--output-schema",
         "--output-last-message",
@@ -116,6 +116,11 @@ def test_mcp_fixture_drives_htsave_tools_and_shell_fixture_does_not(tmp_path: Pa
     shell_prompt = (shell / "prompt.txt").read_text(encoding="utf-8")
 
     assert "htsave_hydrate" in mcp_prompt
+    assert '"rate_limit"' in mcp_prompt
+    assert '"rate_limit": 640' not in mcp_prompt
+    assert "Every listed step is mandatory" in mcp_prompt
+    assert "four explicit rounds" in mcp_prompt
+    assert "exactly 4 required htsave_read calls" in mcp_prompt
     assert mcp_prompt.count('Call the htsave_read tool with path "src/large_module.py".') == 4
     assert mcp_prompt.count("python benchmark_driver.py mutate") == 1
     assert "python benchmark_driver.py emit" not in mcp_prompt
@@ -135,6 +140,31 @@ def test_multi_round_mcp_fixture_reads_every_context_file_each_round(tmp_path: P
     assert len(scenario["emit_paths"]) == 3
     for relative in scenario["emit_paths"]:
         assert prompt.count(f'path "{relative}"') == 4
+    assert "Round 4" in prompt
+
+
+def test_mcp_read_trace_requires_every_path_in_round_order() -> None:
+    scenario = {
+        "emit_paths": ["context/AGENTS.md", "context/config.toml"],
+    }
+    events = "\n".join(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "tool": "htsave_read",
+                    "arguments": {"path": path},
+                },
+            }
+        )
+        for _ in range(4)
+        for path in scenario["emit_paths"]
+    )
+    runner_module._validate_mcp_read_trace(events, scenario)
+
+    with pytest.raises(RuntimeError, match="prescribed read order"):
+        runner_module._validate_mcp_read_trace(events.splitlines()[2], scenario)
 
 
 def test_mcp_manifest_declares_the_htsave_server_and_shell_manifest_does_not() -> None:
@@ -190,8 +220,8 @@ def test_mcp_attempts_get_an_isolated_hook_only_codex_home_that_is_not_retained(
         path="mcp",
     )
 
-    assert len(observed) == 40
-    assert len({home for home, _ in observed}) == 40
+    assert len(observed) == 80
+    assert len({home for home, _ in observed}) == 80
     for home, hooks in observed:
         assert set(hooks["hooks"]) >= {"SessionStart", "PreToolUse", "PostToolUse", "Stop"}
         handler = hooks["hooks"]["PreToolUse"][0]["hooks"][0]
@@ -215,7 +245,7 @@ def test_shell_attempts_do_not_provision_a_codex_home(tmp_path: Path) -> None:
         path="shell",
     )
 
-    assert len(requests) == 40
+    assert len(requests) == 80
     assert all(request.isolated_home is None for request in requests)
     assert all("CODEX_HOME" not in request.env for request in requests)
 
@@ -242,7 +272,7 @@ def test_confirmation_gate_prevents_new_and_resumed_process_spawns(tmp_path: Pat
 
     assert calls == 0
     assert manifest.completed_count == resumed.completed_count == 0
-    assert len(manifest.executions) == 40
+    assert len(manifest.executions) == 80
     assert (output / "manifest.json").is_file()
 
 
@@ -310,10 +340,10 @@ def test_mcp_paid_run_is_allowed_on_the_current_codex_contract(
     )
 
     assert manifest.path == "mcp"
-    assert len(spawned) == 40
+    assert len(spawned) == 80
 
 
-def test_fake_codex_runs_all_40_slots_then_resumes_only_failed_attempt(
+def test_fake_codex_runs_all_80_slots_then_resumes_only_failed_attempt(
     tmp_path: Path,
 ) -> None:
     fake = FakeCodex(fail_once_execution="source_three_line_delta-p02-baseline")
@@ -328,17 +358,30 @@ def test_fake_codex_runs_all_40_slots_then_resumes_only_failed_attempt(
         host="codex",
     )
 
-    assert len(fake.requests) == 40
-    assert first.completed_count == 39
+    assert len(fake.requests) == 80
+    assert first.completed_count == 79
     assert not first.release_report().passed
-    assert len({request.cwd for request in fake.requests}) == 40
-    assert len({request.argv for request in fake.requests}) == 1
+    assert len({request.cwd for request in fake.requests}) == 80
+    assert all(
+        any(
+            value.startswith("mcp_servers.htsave.env.HTSAVE_STATE_DIR=")
+            for value in request.argv
+        )
+        for request in fake.requests
+    )
+    assert all(
+        any(
+            value == f'mcp_servers.htsave.env.HTSAVE_BENCH_ARM="{request.arm}"'
+            for value in request.argv
+        )
+        for request in fake.requests
+    )
     assert len({_environment_without_arm(request) for request in fake.requests}) == 1
     assert {request.env["HTSAVE_BENCH_ARM"] for request in fake.requests} == {
         "baseline",
         "treatment",
     }
-    assert all(request.env["HTSAVE_STATE_DIR"] == "../state" for request in fake.requests)
+    assert all(Path(request.env["HTSAVE_STATE_DIR"]).is_absolute() for request in fake.requests)
 
     resumed = resume_release_benchmark(
         output / "manifest.json",
@@ -346,10 +389,10 @@ def test_fake_codex_runs_all_40_slots_then_resumes_only_failed_attempt(
         process_runner=fake,
     )
 
-    assert len(fake.requests) == 41
+    assert len(fake.requests) == 81
     assert fake.requests[-1].execution_id == "source_three_line_delta-p02-baseline"
     assert fake.requests[-1].attempt_number == 2
-    assert resumed.completed_count == 40
+    assert resumed.completed_count == 80
     assert resumed.release_report().passed
 
     reloaded = load_release_manifest(output / "manifest.json")
@@ -406,6 +449,20 @@ class FakeCodex:
             json.dumps(answer), encoding="utf-8", newline="\n"
         )
         input_tokens = 100 if request.arm == "baseline" else 70
+        read_events = [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "tool": "htsave_read",
+                        "arguments": {"path": path},
+                    },
+                }
+            )
+            for _ in range(4)
+            for path in scenario["emit_paths"]
+        ]
         events = "\n".join(
             [
                 json.dumps(
@@ -415,6 +472,7 @@ class FakeCodex:
                     }
                 ),
                 json.dumps({"type": "turn.started"}),
+                *read_events,
                 json.dumps(
                     {
                         "type": "turn.completed",
@@ -432,7 +490,13 @@ class FakeCodex:
 
 
 def _environment_without_arm(request: ProcessRequest) -> tuple[tuple[str, str], ...]:
-    variable = {"HTSAVE_BENCH_ARM", "CODEX_HOME"}
+    variable = {
+        "HTSAVE_BENCH_ARM",
+        "CODEX_HOME",
+        "HTSAVE_STATE_DIR",
+        "HTSAVE_BENCH_ARTIFACTS",
+        "HTSAVE_BENCH_WORKSPACE",
+    }
     return tuple(sorted((key, value) for key, value in request.env.items() if key not in variable))
 
 

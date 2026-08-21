@@ -214,3 +214,61 @@ def test_installed_command_can_actually_import_htsave(settings_path: Path) -> No
         check=False,
     )
     assert probe.returncode == 0, probe.stderr
+
+
+def test_install_creates_skill_file(tmp_path: Path) -> None:
+    settings = tmp_path / ".claude" / "settings.json"
+    skill = tmp_path / ".claude" / "skills" / "htsave.md"
+    install(settings_path=settings, skill_path=skill)
+    assert skill.is_file()
+    content = skill.read_text(encoding="utf-8")
+    assert "htsave-managed: true" in content
+    assert "HTSAVE/1" in content
+
+
+def test_install_is_idempotent_for_skill(tmp_path: Path) -> None:
+    settings = tmp_path / ".claude" / "settings.json"
+    skill = tmp_path / ".claude" / "skills" / "htsave.md"
+    install(settings_path=settings, skill_path=skill)
+    first = skill.read_text(encoding="utf-8")
+    install(settings_path=settings, skill_path=skill)
+    assert skill.read_text(encoding="utf-8") == first
+
+
+def test_install_refuses_foreign_skill(tmp_path: Path) -> None:
+    settings = tmp_path / ".claude" / "settings.json"
+    skill = tmp_path / ".claude" / "skills" / "htsave.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("my custom htsave notes", encoding="utf-8")
+    with pytest.raises(ClaudeIntegrationError, match="not owned by htsave"):
+        install(settings_path=settings, skill_path=skill)
+
+
+def test_uninstall_removes_owned_skill(tmp_path: Path) -> None:
+    settings = tmp_path / ".claude" / "settings.json"
+    skill = tmp_path / ".claude" / "skills" / "htsave.md"
+    install(settings_path=settings, skill_path=skill)
+    assert skill.is_file()
+    uninstall(settings_path=settings, skill_path=skill, confirm=True)
+    assert not skill.exists()
+
+
+def test_uninstall_preserves_foreign_skill(tmp_path: Path) -> None:
+    settings = tmp_path / ".claude" / "settings.json"
+    foreign_skill = tmp_path / ".claude" / "skills" / "other.md"
+    foreign_skill.parent.mkdir(parents=True)
+    foreign_skill.write_text("other custom notes", encoding="utf-8")
+    install(settings_path=settings)
+    uninstall(settings_path=settings, confirm=True)
+    assert foreign_skill.is_file()
+
+
+def test_status_reports_skill_drift(tmp_path: Path) -> None:
+    settings = tmp_path / ".claude" / "settings.json"
+    skill = tmp_path / ".claude" / "skills" / "htsave.md"
+    install(settings_path=settings, skill_path=skill)
+    skill.unlink()
+    result = status(settings_path=settings, skill_path=skill)
+    assert not result.healthy
+    assert "skill-not-installed" in result.drifts
+

@@ -104,10 +104,17 @@ def _claude_settings(args: argparse.Namespace) -> Path | None:
     return settings.expanduser() if settings is not None else None
 
 
+def _claude_skill(args: argparse.Namespace) -> Path | None:
+    skill = getattr(args, "skill_path", None)
+    return skill.expanduser() if skill is not None else None
+
+
 def _claude_install(args: argparse.Namespace) -> int:
     from .claude_install import install
 
-    status = install(settings_path=_claude_settings(args))
+    status = install(
+        settings_path=_claude_settings(args), skill_path=_claude_skill(args)
+    )
     _emit(status, as_json=args.json)
     return 0
 
@@ -115,7 +122,9 @@ def _claude_install(args: argparse.Namespace) -> int:
 def _claude_status(args: argparse.Namespace) -> int:
     from .claude_install import status as claude_status
 
-    result = claude_status(settings_path=_claude_settings(args))
+    result = claude_status(
+        settings_path=_claude_settings(args), skill_path=_claude_skill(args)
+    )
     _emit(result, as_json=args.json)
     return 0 if result.healthy else 1
 
@@ -123,7 +132,40 @@ def _claude_status(args: argparse.Namespace) -> int:
 def _claude_uninstall(args: argparse.Namespace) -> int:
     from .claude_install import uninstall
 
-    payload = uninstall(settings_path=_claude_settings(args), confirm=args.yes)
+    payload = uninstall(
+        settings_path=_claude_settings(args),
+        skill_path=_claude_skill(args),
+        confirm=args.yes,
+    )
+    _emit(payload, as_json=args.json)
+    return 0
+
+
+def _agy_home(args: argparse.Namespace) -> Path | None:
+    home = getattr(args, "home", None)
+    return home.expanduser() if home is not None else None
+
+
+def _agy_install(args: argparse.Namespace) -> int:
+    from .agy_install import install
+
+    status = install(home=_agy_home(args))
+    _emit(status, as_json=args.json)
+    return 0
+
+
+def _agy_status(args: argparse.Namespace) -> int:
+    from .agy_install import status as agy_status
+
+    result = agy_status(home=_agy_home(args))
+    _emit(result, as_json=args.json)
+    return 0 if result.healthy else 1
+
+
+def _agy_uninstall(args: argparse.Namespace) -> int:
+    from .agy_install import uninstall
+
+    payload = uninstall(home=_agy_home(args), confirm=args.yes)
     _emit(payload, as_json=args.json)
     return 0
 
@@ -175,6 +217,13 @@ def _doctor(args: argparse.Namespace) -> int:
     checks["claude_integration"] = {
         "ok": integration.healthy,
         "status": integration,
+    }
+    from .agy_install import status as agy_integration_status
+
+    agy_status_info = agy_integration_status()
+    checks["agy_integration"] = {
+        "ok": agy_status_info.healthy,
+        "status": agy_status_info,
     }
     plugin_status = _manager(args).status()
     checks["plugin"] = {
@@ -419,25 +468,43 @@ def build_parser() -> argparse.ArgumentParser:
     claude = commands.add_parser("claude", help="manage the Claude Code integration")
     claude_commands = claude.add_subparsers(dest="claude_command", required=True)
     claude_install = claude_commands.add_parser("install")
-    claude_install.add_argument("--settings", type=Path, help="override the settings.json path")
+    claude_install.add_argument("--settings", type=Path, help="override settings.json path")
+    claude_install.add_argument("--skill-path", type=Path, help="override skill file path")
     claude_install.set_defaults(handler=_claude_install)
     claude_status = claude_commands.add_parser("status")
-    claude_status.add_argument("--settings", type=Path, help="override the settings.json path")
+    claude_status.add_argument("--settings", type=Path, help="override settings.json path")
+    claude_status.add_argument("--skill-path", type=Path, help="override skill file path")
     claude_status.set_defaults(handler=_claude_status)
     claude_uninstall = claude_commands.add_parser("uninstall")
-    claude_uninstall.add_argument("--settings", type=Path, help="override the settings.json path")
+    claude_uninstall.add_argument("--settings", type=Path, help="override settings.json path")
+    claude_uninstall.add_argument("--skill-path", type=Path, help="override skill file path")
     claude_uninstall.add_argument("--yes", action="store_true", help="confirm integration removal")
     claude_uninstall.set_defaults(handler=_claude_uninstall)
+
+    agy = commands.add_parser("agy", help="manage the Antigravity CLI integration")
+    agy_commands = agy.add_subparsers(dest="agy_command", required=True)
+    agy_install_cmd = agy_commands.add_parser("install")
+    agy_install_cmd.add_argument("--home", type=Path, help="override config home directory")
+    agy_install_cmd.set_defaults(handler=_agy_install)
+    agy_status_cmd = agy_commands.add_parser("status")
+    agy_status_cmd.add_argument("--home", type=Path, help="override config home directory")
+    agy_status_cmd.set_defaults(handler=_agy_status)
+    agy_uninstall_cmd = agy_commands.add_parser("uninstall")
+    agy_uninstall_cmd.add_argument("--home", type=Path, help="override config home directory")
+    agy_uninstall_cmd.add_argument("--yes", action="store_true", help="confirm removal")
+    agy_uninstall_cmd.set_defaults(handler=_agy_uninstall)
 
     doctor = commands.add_parser("doctor")
     doctor.set_defaults(handler=_doctor)
 
     stats = commands.add_parser("stats")
     stats.add_argument("--session-key")
+    stats.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     stats.set_defaults(handler=_stats)
 
     inspect = commands.add_parser("inspect")
     inspect.add_argument("--session-key")
+    inspect.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     inspect.set_defaults(handler=_inspect)
 
     hydrate = commands.add_parser("hydrate")
@@ -465,7 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_run.add_argument(
         "--confirm-paid-runs",
         action="store_true",
-        help="explicitly authorize the 40 Codex exec calls",
+        help="explicitly authorize the 80 host exec calls",
     )
     benchmark_run.add_argument(
         "--host",

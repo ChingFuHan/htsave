@@ -21,12 +21,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from htsave.agy_install import install as install_agy_integration
 from htsave.benchmark import (
     BENCHMARK_HOSTS,
     BENCHMARK_PATHS,
     DEFAULT_BENCHMARK_PATH,
     DEFAULT_HOST,
     DEFAULT_PATH_FOR_HOST,
+    REQUIRED_PAIRS,
     REQUIRED_SCENARIOS,
     BenchmarkPath,
     BenchmarkReport,
@@ -35,19 +37,21 @@ from htsave.benchmark import (
     Usage,
     evaluate_benchmark,
     evaluate_scenario,
+    parse_agy_exec_json,
     parse_claude_exec_json,
     parse_codex_exec_jsonl,
 )
 from htsave.claude_install import install as install_claude_integration
 from htsave.compat import probe_claude_compatibility, probe_codex_compatibility
 from htsave.errors import CompatibilityError
-from htsave.plugin import MCP_MODULE, load_rendered_hooks
+from htsave.plugin import MCP_MODULE, PLUGIN_NAME, load_rendered_hooks
 
 MANIFEST_SCHEMA_VERSION = 3
-PAIR_COUNT = 5
+PAIR_COUNT = REQUIRED_PAIRS
 EXECUTION_COUNT = len(REQUIRED_SCENARIOS) * PAIR_COUNT * 2
 DEFAULT_PAYLOAD_LINES = 1024
 DEFAULT_MODEL_FOR_HOST: dict[str, str] = {
+    "agy": "gemini-3.7-flash-low",
     "claude": "claude-opus-5",
     "codex": "gpt-5.6-sol",
 }
@@ -425,7 +429,7 @@ def run_release_benchmark(
     python_executable: str | None = None,
     max_executions: int | None = None,
 ) -> ReleaseManifest:
-    """Create a manifest and optionally execute its 40 paid-call slots."""
+    """Create a manifest and optionally execute its 80 paid-call slots."""
 
     output_dir = Path(output_dir).resolve()
     manifest_path = output_dir / "manifest.json"
@@ -474,6 +478,12 @@ def resume_release_benchmark(
 def _require_paid_contract(host: Host, executable: str, path: BenchmarkPath) -> None:
     """Refuse paid runs whose measured delivery path the host cannot serve."""
 
+    if host == "agy":
+        if path != "mcp":
+            raise CompatibilityError("agy paid benchmark requires the explicit MCP path")
+        if shutil.which(executable) is None and not Path(executable).is_file():
+            raise CompatibilityError(f"agy executable was not found: {executable}")
+        return
     if host == "claude":
         claude = probe_claude_compatibility(executable=executable)
         if not claude.supported:
@@ -543,21 +553,31 @@ def generate_scenario_fixture(
     else:
         scenario, facts = _generate_multi_context(destination, payload_lines)
     steps = _scenario_steps(scenario_id, scenario, path)
+    expected_reads = sum("htsave_read" in step for step in steps)
+    if path == "shell":
+        expected_reads = sum("benchmark_driver.py emit" in step for step in steps)
 
     scenario = {**scenario, "expected_answers": facts}
     _write_json(destination / "scenario.json", scenario)
-    answer_example = {
-        "scenario_id": scenario_id,
-        "answers": facts,
-        "assumptions": [],
+    answer_properties = {
+        key: _schema_for_value(value) for key, value in facts.items()
     }
     schema = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
-            "scenario_id": {"const": scenario_id},
-            "answers": {"type": "object"},
-            "assumptions": {"type": "array", "maxItems": 0},
+            "scenario_id": {"type": "string", "const": scenario_id},
+            "answers": {
+                "type": "object",
+                "properties": answer_properties,
+                "required": sorted(answer_properties),
+                "additionalProperties": False,
+            },
+            "assumptions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 0,
+            },
         },
         "required": ["scenario_id", "answers", "assumptions"],
         "additionalProperties": False,
@@ -570,8 +590,8 @@ def generate_scenario_fixture(
         .format(
             scenario_id=scenario_id,
             steps="\n".join(f"{index}. {command}" for index, command in enumerate(steps, 1)),
-            facts=json.dumps(facts, sort_keys=True),
-            answer_example=json.dumps(answer_example, sort_keys=True),
+            expected_reads=expected_reads,
+            fact_keys=json.dumps(sorted(facts), sort_keys=True),
         )
     )
     (destination / "prompt.txt").write_text(prompt, encoding="utf-8", newline="\n")
@@ -599,11 +619,11 @@ def _scenario_steps(
             raise ValueError("scenario emit_paths must be a list of strings")
         round_steps = [f'Call the htsave_read tool with path "{item}".' for item in emit_paths]
         mutate_step = _MUTATE_STEP
-    steps = list(round_steps)
+    steps = [f"Round 1: {step}" for step in round_steps]
     if mutating:
-        steps.append(mutate_step)
-    for _ in range(_ROUNDS - 1):
-        steps.extend(round_steps)
+        steps.append(f"Between round 1 and round 2: {mutate_step}")
+    for round_index in range(1, _ROUNDS):
+        steps.extend(f"Round {round_index + 1}: {step}" for step in round_steps)
     return steps
 
 
@@ -636,10 +656,10 @@ def _generate_large_readme(root: Path, lines: int) -> tuple[dict[str, object], d
     content = [
         "# Deterministic Operations Manual\n",
         f"Codename: {facts['codename']}\n",
-        *_filler("readme", lines // 2),
         f"Retention days: {facts['retention_days']}\n",
-        *_filler("readme-tail", lines - lines // 2),
         f"Failover region: {facts['failover_region']}\n",
+        *_filler("readme", lines),
+        *_filler("readme-tail", lines),
     ]
     (root / "README.md").write_text("".join(content), encoding="utf-8", newline="\n")
     return {"emit_paths": ["README.md"], "mutations": []}, facts
@@ -672,17 +692,15 @@ def _generate_source_delta(root: Path, lines: int) -> tuple[dict[str, object], d
 
 def _generate_test_output(root: Path, lines: int) -> tuple[dict[str, object], dict[str, object]]:
     output = [
-        f"PASSED tests/test_unit_{index:05d}.py::test_{_row_hash('tests', index)[:12]}\n"
-        for index in range(lines)
+        "FAILED test_atomicity - HTS-E410\n",
+        "FAILED test_restore - HTS-E410\n",
+        "FAILED test_generation - HTS-E410\n",
+        f"{lines + 3} tests collected, 3 failed\n",
+        *(
+            f"PASSED tests/test_unit_{index:05d}.py::test_{_row_hash('tests', index)[:12]}\n"
+            for index in range(lines)
+        ),
     ]
-    output.extend(
-        [
-            "FAILED tests/test_cache.py::test_atomicity - HTS-E410\n",
-            "FAILED tests/test_delta.py::test_restore - HTS-E410\n",
-            "FAILED tests/test_registry.py::test_generation - HTS-E410\n",
-            f"{lines + 3} tests collected, 3 failed\n",
-        ]
-    )
     (root / "test-output.txt").write_text("".join(output), encoding="utf-8", newline="\n")
     facts = {
         "failed": 3,
@@ -696,7 +714,12 @@ def _generate_multi_context(root: Path, lines: int) -> tuple[dict[str, object], 
     context = root / "context"
     source = context / "src"
     source.mkdir(parents=True)
-    per_file = max(1, lines // 3)
+    # Four rounds of the three-file fixture must stay below the host's context
+    # boundary in the raw baseline arm. The benchmark counts only paired
+    # measurements whose two arms saw the same conversation; a compacted raw
+    # arm would no longer be comparable to treatment.
+    context_lines = max(3, lines // 6)
+    per_file = max(1, context_lines // 3)
     (context / "AGENTS.md").write_text(
         "Release command: python -m acme.release --locked\n" + "".join(_filler("agents", per_file)),
         encoding="utf-8",
@@ -709,7 +732,7 @@ def _generate_multi_context(root: Path, lines: int) -> tuple[dict[str, object], 
     )
     (source / "app.py").write_text(
         'FALLBACK_STATE = "circuit-open"\n'
-        + "".join(f"# {line}" for line in _filler("app", lines - 2 * per_file)),
+        + "".join(f"# {line}" for line in _filler("app", context_lines - 2 * per_file)),
         encoding="utf-8",
         newline="\n",
     )
@@ -750,9 +773,34 @@ def _host_argv(
 ) -> tuple[str, ...]:
     if host not in BENCHMARK_HOSTS:
         raise ValueError(f"unknown benchmark host: {host!r}")
+    if host == "agy":
+        return _agy_argv(executable, model, reasoning_effort, path)
     if host == "claude":
         return _claude_argv(executable, model, path)
     return _codex_argv(executable, model, reasoning_effort, path, python_executable)
+
+
+def _agy_argv(
+    executable: str, model: str, reasoning_effort: str, path: BenchmarkPath
+) -> tuple[str, ...]:
+    if path != "mcp":
+        raise ValueError("the agy benchmark measures its explicit MCP path")
+    return (
+        executable,
+        "--output-format",
+        "stream-json",
+        "--model",
+        model,
+        "--effort",
+        reasoning_effort,
+        "--json-schema",
+        "answer.schema.json",
+        "--dangerously-skip-permissions",
+        "--add-dir",
+        "../state",
+        "--add-dir",
+        "../artifacts",
+    )
 
 
 def _claude_argv(executable: str, model: str, path: BenchmarkPath) -> tuple[str, ...]:
@@ -828,9 +876,7 @@ def _codex_argv(
         "../artifacts",
         "--model",
         model,
-        "--sandbox",
-        "workspace-write",
-        "--ask-for-approval",
+        "--approve-for-me",
         "never",
         "--config",
         f'model_reasoning_effort="{reasoning_effort}"',
@@ -849,7 +895,6 @@ def _codex_argv(
         "answer.schema.json",
         "--output-last-message",
         "../artifacts/answer.json",
-        "-",
     )
 
 
@@ -914,13 +959,15 @@ def _run_attempt(
         shutil.copy2(workspace / "prompt.txt", artifacts / "prompt.txt")
         shutil.copy2(workspace / "answer.schema.json", artifacts / "answer.schema.json")
         shutil.copy2(workspace / "scenario.json", artifacts / "scenario.json")
+        prompt = (workspace / "prompt.txt").read_text(encoding="utf-8")
 
         env = dict(os.environ)
         env.update(
             {
-                "HTSAVE_STATE_DIR": "../state",
-                "HTSAVE_BENCH_ARTIFACTS": "../artifacts",
+                "HTSAVE_STATE_DIR": str(state.resolve()),
+                "HTSAVE_BENCH_ARTIFACTS": str(artifacts.resolve()),
                 "HTSAVE_BENCH_ARM": execution.arm,
+                "HTSAVE_BENCH_WORKSPACE": str(workspace.resolve()),
             }
         )
         env.pop("CODEX_HOME", None)
@@ -932,6 +979,15 @@ def _run_attempt(
                 python_executable=manifest.python_executable,
             )
             env["CLAUDE_CONFIG_DIR"] = str(isolated_home)
+        elif manifest.host == "agy":
+            isolated_home = _provision_agy_home(
+                attempt_root,
+                arm=execution.arm,
+                python_executable=manifest.python_executable,
+                state=state,
+                workspace=workspace,
+            )
+            env["HOME"] = str(isolated_home)
         elif manifest.path == "mcp":
             isolated_home = _provision_codex_home(
                 attempt_root, python_executable=manifest.python_executable
@@ -943,10 +999,10 @@ def _run_attempt(
             pair_index=execution.pair_index,
             arm=execution.arm,
             attempt_number=attempt_number,
-            argv=manifest.argv,
+            argv=_attempt_argv(manifest, state=state, arm=execution.arm, prompt=prompt),
             cwd=workspace,
             env=env,
-            stdin=(workspace / "prompt.txt").read_text(encoding="utf-8"),
+            stdin="" if manifest.host == "agy" else prompt,
             timeout_seconds=manifest.timeout_seconds,
             isolated_home=isolated_home,
         )
@@ -959,6 +1015,9 @@ def _run_attempt(
         if manifest.host == "claude":
             protocol = parse_claude_exec_json(output.stdout)
             _write_claude_answer(output.stdout, artifacts / "answer.json")
+        elif manifest.host == "agy":
+            protocol = parse_agy_exec_json(output.stdout)
+            _write_agy_answer(output.stdout, artifacts / "answer.json")
         else:
             protocol = parse_codex_exec_jsonl(output.stdout)
         if not protocol.succeeded or protocol.usage is None:
@@ -968,6 +1027,10 @@ def _run_attempt(
         expected_answers = scenario.get("expected_answers") if isinstance(scenario, dict) else None
         if not isinstance(expected_answers, dict):
             raise RuntimeError("fixture is missing its deterministic answer oracle")
+        if manifest.host == "codex" and manifest.path == "mcp":
+            _validate_mcp_read_trace(output.stdout, scenario)
+        elif manifest.host == "agy" and manifest.path == "mcp":
+            _validate_agy_read_trace(output.stdout, scenario)
         _validate_answer(artifacts / "answer.json", execution.scenario_id, expected_answers)
         return AttemptRecord(
             attempt_number=attempt_number,
@@ -993,6 +1056,28 @@ def _run_attempt(
             # The isolated home holds a copy of the operator's Codex credentials.
             # Retained artifacts must never include it.
             shutil.rmtree(isolated_home, ignore_errors=True)
+
+
+def _attempt_argv(
+    manifest: ReleaseManifest, *, state: Path, arm: Arm, prompt: str
+) -> tuple[str, ...]:
+    """Add per-attempt host settings that cannot live in the manifest argv."""
+
+    if manifest.host == "agy":
+        # agy does not consume a plain-text stdin prompt in print mode; its
+        # public CLI requires the prompt as the --prompt option.
+        return (*manifest.argv, "--prompt", prompt)
+
+    if manifest.host != "codex" or manifest.path != "mcp":
+        return manifest.argv
+    insertion = manifest.argv.index("--output-schema")
+    server_env = (
+        "--config",
+        f"mcp_servers.htsave.env.HTSAVE_STATE_DIR={json.dumps(str(state.resolve()))}",
+        "--config",
+        f"mcp_servers.htsave.env.HTSAVE_BENCH_ARM={json.dumps(arm)}",
+    )
+    return manifest.argv[:insertion] + server_env + manifest.argv[insertion:]
 
 
 def _extract_json_object(text: str) -> str:
@@ -1030,6 +1115,32 @@ def _write_claude_answer(stdout: str, destination: Path) -> None:
     answer = payload.get("result") if isinstance(payload, dict) else None
     if not isinstance(answer, str):
         raise RuntimeError("claude result did not contain a final message")
+    destination.write_text(_extract_json_object(answer), encoding="utf-8", newline="\n")
+
+
+def _write_agy_answer(stdout: str, destination: Path) -> None:
+    """Extract agy's final response from its stream-json result event."""
+
+    result: Mapping[str, object] | None = None
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if isinstance(event, dict) and event.get("event") == "result":
+            value = event.get("result")
+            if isinstance(value, dict):
+                result = value
+    if result is None:
+        raise RuntimeError("agy stream did not contain a result event")
+    structured_output = result.get("structured_output")
+    if isinstance(structured_output, dict):
+        destination.write_text(
+            json.dumps(structured_output, sort_keys=True), encoding="utf-8", newline="\n"
+        )
+        return
+    answer = result.get("response")
+    if not isinstance(answer, str):
+        raise RuntimeError("agy result did not contain a final response")
     destination.write_text(_extract_json_object(answer), encoding="utf-8", newline="\n")
 
 
@@ -1074,10 +1185,46 @@ def _provision_codex_home(attempt_root: Path, *, python_executable: str) -> Path
     return home
 
 
+def _provision_agy_home(
+    attempt_root: Path,
+    *,
+    arm: Arm,
+    python_executable: str,
+    state: Path,
+    workspace: Path,
+) -> Path:
+    """Create an isolated HOME carrying only the htsave agy integration."""
+
+    home = attempt_root / "agy-home"
+    home.mkdir()
+    if os.name != "nt":
+        home.chmod(0o700)
+    install_agy_integration(home=home)
+    settings_path = home / ".gemini" / "antigravity-cli" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        settings_path,
+        {
+            "trustedWorkspaces": [str(workspace.resolve())],
+            "permissions": {"allow": ["mcp(htsave/*)", "command(*)"]},
+        },
+    )
+    config_path = home / ".gemini" / "config" / "mcp_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    server = config["mcpServers"][PLUGIN_NAME]
+    server["env"] = {
+        "HTSAVE_STATE_DIR": str(state.resolve()),
+        "HTSAVE_BENCH_ARM": arm,
+    }
+    _write_json(config_path, config)
+    return home
+
+
 _CREDENTIAL_FILES: dict[str, tuple[str, str]] = {
     # isolated-home marker -> (source directory env var / default, file name)
     "codex-home": ("CODEX_HOME", "auth.json"),
     "claude-config": ("CLAUDE_CONFIG_DIR", ".credentials.json"),
+    "agy-home": ("HOME", ".gemini/antigravity-cli/antigravity-oauth-token"),
 }
 
 
@@ -1088,12 +1235,18 @@ def _install_host_credentials(home: Path) -> None:
     if entry is None:
         raise RuntimeError(f"unknown isolated home layout: {home.name}")
     variable, file_name = entry
-    default = Path.home() / (".codex" if variable == "CODEX_HOME" else ".claude")
+    if variable == "CODEX_HOME":
+        default = Path.home() / ".codex"
+    elif variable == "CLAUDE_CONFIG_DIR":
+        default = Path.home() / ".claude"
+    else:
+        default = Path.home()
     source = Path(os.environ.get(variable) or default)
     credentials = source / file_name
     if not credentials.is_file():
         raise RuntimeError(f"credentials were not found at {credentials}")
     target = home / file_name
+    target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(credentials, target)
     if os.name != "nt":
         target.chmod(0o600)
@@ -1183,6 +1336,79 @@ def _validate_answer(path: Path, scenario_id: str, expected_answers: Mapping[str
         raise RuntimeError("answer assumptions must be empty")
 
 
+def _validate_mcp_read_trace(payload: str, scenario: Mapping[str, object]) -> None:
+    """Require the MCP arm to execute every prescribed read in order.
+
+    The prompt contains the answer oracle so a host can otherwise produce a
+    valid answer while skipping reads. That would make baseline and treatment
+    measure different conversations, so such an attempt is not a valid pair.
+    """
+
+    emit_paths = scenario.get("emit_paths")
+    if not isinstance(emit_paths, list) or not all(
+        isinstance(path, str) for path in emit_paths
+    ):
+        raise RuntimeError("fixture is missing valid MCP emit paths")
+    expected = tuple(path for _ in range(_ROUNDS) for path in emit_paths)
+    observed: list[str] = []
+    for line in payload.splitlines():
+        event = json.loads(line)
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "mcp_tool_call":
+            continue
+        if item.get("tool") != "htsave_read":
+            continue
+        arguments = item.get("arguments")
+        if not isinstance(arguments, dict) or not isinstance(arguments.get("path"), str):
+            raise RuntimeError("htsave_read trace contains an invalid path")
+        observed.append(arguments["path"])
+    if tuple(observed) != expected:
+        raise RuntimeError(
+            "htsave_read trace does not match the prescribed read order: "
+            f"expected {list(expected)}, observed {observed}"
+        )
+
+
+def _validate_agy_read_trace(payload: str, scenario: Mapping[str, object]) -> None:
+    """Require agy's stream-json MCP calls to match the prescribed read order."""
+
+    emit_paths = scenario.get("emit_paths")
+    if not isinstance(emit_paths, list) or not all(
+        isinstance(path, str) for path in emit_paths
+    ):
+        raise RuntimeError("fixture is missing valid agy emit paths")
+    expected = tuple(path for _ in range(_ROUNDS) for path in emit_paths)
+    observed: list[str] = []
+    for line in payload.splitlines():
+        event = json.loads(line)
+        if not isinstance(event, dict) or event.get("event") != "step_update":
+            continue
+        update = event.get("step_update")
+        if not isinstance(update, dict) or update.get("step_type") != "tool":
+            continue
+        if update.get("state") != "DONE":
+            continue
+        info = update.get("tool_info")
+        if not isinstance(info, dict):
+            continue
+        parameters = info.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        if parameters.get("ServerName") != "htsave" or parameters.get("ToolName") != "htsave_read":
+            continue
+        arguments = parameters.get("Arguments")
+        if not isinstance(arguments, dict) or not isinstance(arguments.get("path"), str):
+            raise RuntimeError("agy htsave_read trace contains an invalid path")
+        observed.append(arguments["path"])
+    if tuple(observed) != expected:
+        raise RuntimeError(
+            "agy htsave_read trace does not match the prescribed read order: "
+            f"expected {list(expected)}, observed {observed}"
+        )
+
+
 def _next_attempt_number(output_dir: Path, execution: ExecutionSpec) -> int:
     execution_root = output_dir / "runs" / execution.execution_id
     existing = [
@@ -1223,6 +1449,31 @@ def _write_json(path: Path, value: object) -> None:
         encoding="utf-8",
         newline="\n",
     )
+
+
+def _schema_for_value(value: object) -> dict[str, object]:
+    """Render a strict response-schema fragment from deterministic oracle data."""
+
+    if isinstance(value, bool):
+        return {"type": "boolean"}
+    if isinstance(value, int):
+        return {"type": "integer"}
+    if isinstance(value, float):
+        return {"type": "number"}
+    if isinstance(value, str):
+        return {"type": "string"}
+    if isinstance(value, list):
+        items = _schema_for_value(value[0]) if value else {}
+        return {"type": "array", "items": items}
+    if isinstance(value, dict):
+        properties = {key: _schema_for_value(item) for key, item in value.items()}
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": sorted(properties),
+            "additionalProperties": False,
+        }
+    raise TypeError(f"unsupported oracle value type: {type(value).__name__}")
 
 
 def _required_str(value: Mapping[str, object], key: str) -> str:

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from htsave.benchmark import (
+    REQUIRED_PAIRS,
     REQUIRED_SCENARIOS,
     CodexExecProtocolError,
     PairwiseResult,
@@ -40,7 +41,7 @@ def _pairs(
             baseline=_usage(baseline_input, baseline_cached),
             treatment=_usage(treatment_input, treatment_cached),
         )
-        for index in range(5)
+        for index in range(REQUIRED_PAIRS)
     )
 
 

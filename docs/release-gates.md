@@ -36,7 +36,7 @@ htsave has two delivery paths and two hosts. The paths are gated separately,
 because Codex CLI supports one of them today and not the other; Claude Code
 supports both. `htsave doctor` reports every combination.
 
-### Claude Code transparent path gate — met
+### Claude Code transparent path gate — contract met; live savings gate passed
 
 - `probe_claude_compatibility` reports `posttool_result_replacement` for the
   installed build, and the adapter emits
@@ -47,36 +47,44 @@ supports both. `htsave doctor` reports every combination.
 - `htsave claude install` is idempotent, tags every entry it owns, preserves
   every foreign hook handler in `settings.json`, and `uninstall` previews unless
   `--yes` and never deletes session data.
-- Verified live against Claude Code 2.1.237: three identical `cat` calls
-  produced 28290 bytes, then two 131-byte REF frames; 3 events, 1 FULL, 2 REF,
-  13468 of 20397 estimated tokens saved.
-- One real paired benchmark pair (`large_readme_exact`, 256 payload lines)
-  measured 95057 baseline against 45848 treatment billed input tokens, a 51.8%
-  reduction against the 30% threshold, at a cost of $1.23.
+- Verified live against Claude Code 2.1.238 across all 4 scenarios (80/80 runs,
+  10 pairs each). All attempts passed the deterministic oracle. Measured median
+  input reductions were 94.91%, 93.22%, 93.43%, and 92.40%; all four met the
+  30% savings gate. The implementation contract is met and this empirical release
+  gate passed. (Manifest: `/tmp/htsave-live-claude-v6/manifest.json`)
+- Full manifest paths, arithmetic, and the savings decision are recorded
+  in [verify.md](../verify.md).
 
-The remaining 38 slots are unrun by operator choice, so the median-across-five
--pairs gate is **not** yet satisfied for any scenario. Finish it with:
-
-```bash
-htsave benchmark run --output DIR --resume --confirm-paid-runs
-```
-
-At the observed rate a full 40-slot run costs roughly $25.
-
-### Codex MCP path gate — acceptable now
+### Codex MCP path gate — met
 
 The explicit `htsave_read` and `htsave_hydrate` tools, reached through
 PreToolUse `updatedInput` capability injection.
 
 - `probe_codex_compatibility` reports `mcp_tool_injection` for the installed
-  version, and `htsave benchmark run --path mcp` refuses a paid run when it does
-  not.
+  version, and `htsave benchmark run --path mcp` validates the supported contract.
+- Verified live across all 4 scenarios (80/80 runs, 10 pairs each): all 4
+  scenarios passed with 30.43% ~ 41.69% median pairwise input reduction against
+  `gpt-5.6-luna` (Low), satisfying the release gate. `luna` is the local model
+  selection for this run; no official public pricing claim is made.
 - The MCP fixtures instruct the model to read every file through `htsave_read`
   and to call `htsave_hydrate` for any returned reference.
 - Every attempt runs against a throwaway `CODEX_HOME` holding only the rendered
   htsave hooks, so both arms see one identical hook set and no operator hooks.
   Credentials are copied in by the real spawn alone and removed with the
   attempt.
+
+### Antigravity agy integration gate — installed; live savings gate red
+
+- `htsave --json agy status` reports `state: installed`, with hooks, MCP, and
+  skill registered and no drift.
+- Verified live against agy 1.1.17 across all 4 scenarios (80/80 runs, 10 pairs
+  each). All attempts passed the deterministic oracle. Measured median input
+  reductions were −18.69%, 26.07%, −0.78%, and 1.96%; none met the 30% savings
+  gate. This is a valid red empirical result, not an execution failure.
+  (Manifest: `/tmp/htsave-live-agy-v2/manifest.json`)
+- No official model price is inferred. `gemini-3.7-flash-low` is only the local
+  model selection for this run.
+
 
 ### Codex transparent PostToolUse path gate — externally blocked
 
@@ -107,20 +115,25 @@ set of thresholds.
 - `--host codex` measures `mcp` by default; its `shell` path stays defined so
   the transparent path can be measured unchanged the day Codex ships the
   contract.
+- `--host agy` measures the explicit MCP path, using an isolated HOME, trust
+  workspace, MCP config, skill, and hooks; each execution gets a fresh
+  workspace, home, and state.
 
 Claude Code reports usage per assistant turn under `usage.iterations`, and its
 top-level counters describe only the final turn, so `parse_claude_exec_json`
 sums every iteration. Cache reads are counted as billed input and reported
 separately; they are never subtracted. Claude Code has no `--output-schema`, so
 the final message is parsed out of prose or a code fence before being compared
-exactly against the fixture oracle.
+exactly against the fixture oracle. The canonical model used for the recorded
+run was `claude-haiku-4-5-20251001`; the old `claude-3-5-haiku` alias was not
+available in this account.
 
 `--max-executions N` runs at most N slots and stops; `--resume` finishes the
 rest. Spending the full 40 slots to prove wiring that one pair can prove is
 waste, and the first bounded run caught a real answer-extraction failure that
 would otherwise have burned every slot.
 
-For each of four scenarios, run at least five adjacent baseline/treatment pairs
+For each of four scenarios, run ten adjacent baseline/treatment pairs
 from identical clean fixtures and isolated sessions:
 
 1. large README reread;
@@ -151,5 +164,21 @@ Infrastructure failures are retained and resumed under the same pair/arm id;
 they are not silently discarded or replaced.
 
 Paid benchmark runs require explicit `--confirm-paid-runs`. A dry preflight and
-fake-Codex integration suite must pass first, and the contract preflight for the
-selected path must pass before any Codex process is spawned.
+fake-host integration suite must pass first, and the contract preflight for the
+selected path must pass before any host process is spawned.
+
+## Recorded live evidence
+
+The completed manifests used for the release decision are:
+
+| Host | Manifest | Executions | Report | Median input reduction by scenario |
+| :--- | :--- | ---: | :--- | :--- |
+| Codex CLI / MCP | `/tmp/htsave-live-codex-luna-v14/manifest.json` | 80/80 | **passed** | 41.69%, 36.57%, 39.94%, 30.43% |
+| Claude Code / shell | `/tmp/htsave-live-claude-v6/manifest.json` | 80/80 | **passed** | 94.91%, 93.22%, 93.43%, 92.40% |
+| agy / MCP | `/tmp/htsave-live-agy-v2/manifest.json` | 80/80 | **failed savings gate** | −18.69%, 26.07%, −0.78%, 1.96% |
+
+The reports above are generated by `htsave benchmark report` from the manifests
+above. The exact fractions and all pairwise values remain in the JSON manifests;
+the table rounds only for readability. The agy red gate is a valid empirical
+result and is not a basis for claiming agy savings. This evidence does not
+support a completed v1 release while the agy savings gate remains red.

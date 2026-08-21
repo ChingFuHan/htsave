@@ -3,15 +3,31 @@ This is deterministic htsave benchmark scenario "{scenario_id}".
 Perform these steps as separate tool calls, exactly in this order:
 {steps}
 
+Every listed step is mandatory. Do not stop early, even if an answer fact
+appears obvious from context.
+The numbered steps are four explicit rounds; finish every call in rounds 1,
+2, 3, and 4 in the listed order.
+There are exactly {expected_reads} required htsave_read calls. Count the
+successful calls and do not produce the final answer until all {expected_reads}
+are complete.
+
 Every file read must use the htsave_read MCP tool. If htsave_read returns an
-htsave reference line instead of file text, call htsave_hydrate with that exact
-reference before you rely on the content.
+HTSAVE/1 REF frame instead of file text, extract only the `target=sha256:...`
+value and call htsave_hydrate with that value as its required `ref` argument
+(for example, `{{"ref":"sha256:..."}}`). Never pass the whole REF frame, and
+never call htsave_hydrate without `ref`. Do not hydrate a repeated REF when the
+same exact content was already returned earlier and no new answer fact needs
+those bytes; hydrate only when the exact bytes are genuinely needed.
 
 Do not use web search, subagents, or any other file-reading command or tool.
 After all steps finish, your entire final message must be exactly one JSON
 object matching answer.schema.json. No prose, no explanation, no code fences.
-The canonical facts to report are:
-{facts}
+The canonical fact keys to report are listed below. Read their exact values
+from the required files after completing every step:
+{fact_keys}
 
-Use this exact response shape, with no extra claims:
-{answer_example}
+Use the exact response shape defined by answer.schema.json, with no extra
+claims.
+The final JSON object must contain exactly these top-level fields:
+`scenario_id` (the value "{scenario_id}"), `answers` (exactly the keys
+listed above), and `assumptions` (an empty array).

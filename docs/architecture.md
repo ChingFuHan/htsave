@@ -5,10 +5,12 @@ boundary is exact UTF-8 bytes, not semantic similarity. The domain package does
 not know about hook JSON or MCP; per-host adapters translate supported events
 into domain operations and fail open at that boundary.
 
-Two hosts are supported, and they differ in one decisive way. Claude Code
-honors `hookSpecificOutput.updatedToolOutput`, so repeated tool results are
-replaced transparently. Codex CLI has no equivalent successful-result response,
-so there its `PostToolUse` adapter can only observe.
+Three hosts are supported, and they differ in one decisive way on the
+transparent path. Claude Code honors `hookSpecificOutput.updatedToolOutput`,
+so repeated tool results are replaced transparently. Codex CLI has no
+equivalent successful-result response, so there its `PostToolUse` adapter can
+only observe. Antigravity agy uses explicit MCP tools and fail-open lifecycle
+hooks; like Codex, it has no transparent PostToolUse replacement contract.
 
 ## Non-negotiable invariants
 
@@ -64,16 +66,17 @@ Codex lifecycle hooks        htsave MCP tools          htsave CLI
   and estimated token accounting.
 - `cas`, `registry`, and `paths` own local durability, migrations, concurrency,
   permissions, and session isolation.
-- `codex_hooks` and `claude_hooks` own per-host event parsing, generation
-  transitions, subagent ambiguity, and one-use MCP session metadata. Only
-  `claude_hooks` emits a replacement result.
+- `codex_hooks`, `claude_hooks`, and `agy_hooks` own per-host event parsing,
+  generation transitions, subagent ambiguity, and one-use MCP session metadata.
+  Only `claude_hooks` emits a replacement result; `agy_hooks` injects a
+  one-time `_htsave_context` capability into `call_mcp_tool` nested Arguments.
 - `compat` owns host detection and what each host's contract permits.
 - `mcp_server` owns workspace path authorization and explicit read/hydrate
   results.
-- `plugin` (Codex marketplace) and `claude_install` (Claude Code
-  `settings.json`) own installation, and `cli` owns operator actions. They never
-  delete session data implicitly, and `claude_install` only ever adds or removes
-  entries it has tagged as its own.
+- `plugin` (Codex marketplace), `claude_install` (Claude Code `settings.json`),
+  and `agy_install` (Antigravity `~/.gemini/config/`) own installation, and
+  `cli` owns operator actions. They never delete session data implicitly, and
+  each install module only ever adds or removes entries it has tagged as its own.
 
 ## Lifecycle state
 

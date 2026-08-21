@@ -3,11 +3,23 @@ This is deterministic htsave benchmark scenario "{scenario_id}".
 Run these commands as separate shell tool calls, exactly in this order:
 {steps}
 
+Every listed step is mandatory. Do not stop early, even if an answer fact
+appears obvious from context.
+The numbered steps are four explicit rounds; finish every command in rounds 1,
+2, 3, and 4 in the listed order.
+There are exactly {expected_reads} required file-read steps. Count the
+completed steps and do not produce the final answer until all {expected_reads}
+are complete.
+
 Do not use web search, MCP tools, subagents, or alternate file-reading commands.
 After all commands finish, your entire final message must be exactly one JSON
 object matching answer.schema.json. No prose, no explanation, no code fences.
-The canonical facts to report are:
-{facts}
+The canonical fact keys to report are listed below. Read their exact values
+from the required files after completing every step:
+{fact_keys}
 
-Use this exact response shape, with no extra claims:
-{answer_example}
+Use the exact response shape defined by answer.schema.json, with no extra
+claims.
+The final JSON object must contain exactly these top-level fields:
+`scenario_id` (the value "{scenario_id}"), `answers` (exactly the keys
+listed above), and `assumptions` (an empty array).

@@ -128,7 +128,7 @@ def test_benchmark_run_is_paid_call_gated_and_report_is_explicit(tmp_path: Path,
     dry_run = json.loads(capsys.readouterr().out)
     assert dry_run["dry_run"] is True
     assert dry_run["completed"] == 0
-    assert dry_run["required_executions"] == 40
+    assert dry_run["required_executions"] == 80
     assert dry_run["report"]["passed"] is False
 
     assert (

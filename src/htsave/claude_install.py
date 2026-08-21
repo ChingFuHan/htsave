@@ -31,6 +31,8 @@ CLAUDE_HOOK_MODULE = "htsave.claude_hooks"
 # the hook at a Python that cannot import htsave.
 OWNER_KEY = "htsaveOwned"
 SETTINGS_RELATIVE = Path(".claude") / "settings.json"
+SKILL_RELATIVE = Path(".claude") / "skills" / "htsave.md"
+SKILL_MANAGED_KEY = "htsave-managed"
 # Every lifecycle event the adapter acts on.  Matchers stay absent so Claude
 # Code runs the handler for every tool; the adapter itself decides what is
 # unambiguous enough to touch.
@@ -66,6 +68,7 @@ class ClaudeIntegrationStatus:
     hook_events: tuple[str, ...]
     mcp_registered: bool
     foreign_hook_handlers: int
+    skill_installed: bool = False
     drifts: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -75,6 +78,90 @@ class ClaudeIntegrationStatus:
 
 def default_settings_path(home: Path | None = None) -> Path:
     return (home or Path.home()) / SETTINGS_RELATIVE
+
+
+def default_skill_path(home: Path | None = None) -> Path:
+    return (home or Path.home()) / SKILL_RELATIVE
+
+
+def _resolve_skill_path(settings_path: Path | None, skill_path: Path | None) -> Path:
+    if skill_path is not None:
+        return skill_path
+    if settings_path is not None:
+        return settings_path.parent / "skills" / "htsave.md"
+    return default_skill_path()
+
+
+def _claude_skill_template() -> str:
+    """Load the Claude Code skill template from the packaged plugin tree."""
+    packaged = (
+        Path(__file__).resolve().parent / "_plugin" / "htsave" / "skills" / "claude" / "htsave.md"
+    )
+    if packaged.is_file():
+        return packaged.read_text(encoding="utf-8")
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "plugin"
+        / "htsave"
+        / "skills"
+        / "claude"
+        / "htsave.md"
+    )
+    if source.is_file():
+        return source.read_text(encoding="utf-8")
+    raise ClaudeIntegrationError("packaged Claude Code skill template is missing")
+
+
+def _is_owned_skill(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        content = path.read_text(encoding="utf-8")
+        return "htsave-managed: true" in content
+    except OSError:
+        return False
+
+
+def _install_skill(
+    skill_path: Path | None = None, settings_path: Path | None = None
+) -> None:
+    target = _resolve_skill_path(settings_path, skill_path)
+    if target.exists() and not _is_owned_skill(target):
+        raise ClaudeIntegrationError(
+            f"skill file '{target}' already exists and is not owned by htsave"
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    content = _claude_skill_template()
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=target.parent, prefix=".htsave-skill.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _uninstall_skill(
+    skill_path: Path | None = None, settings_path: Path | None = None
+) -> None:
+    target = _resolve_skill_path(settings_path, skill_path)
+    if not target.exists():
+        return
+    if not _is_owned_skill(target):
+        return
+    target.unlink()
+    # Clean up empty directory if applicable
+    skill_dir = target.parent
+    if skill_dir.is_dir() and not any(skill_dir.iterdir()):
+        skill_dir.rmdir()
+
 
 
 def _read_settings(path: Path) -> dict[str, Any]:
@@ -226,12 +313,16 @@ def status(
     *,
     settings_path: Path | None = None,
     python_executable: Path | None = None,
+    skill_path: Path | None = None,
 ) -> ClaudeIntegrationStatus:
-    """Report what htsave owns in the settings file without changing anything."""
+    """Report what htsave owns in the settings file and skills without changing anything."""
 
     path = settings_path or default_settings_path()
     interpreter = (python_executable or Path(sys.executable)).expanduser()
     settings = _read_settings(path)
+
+    skill_target = _resolve_skill_path(settings_path, skill_path)
+    skill_installed = _is_owned_skill(skill_target)
 
     installed_events: list[str] = []
     versions: set[str] = set()
@@ -260,9 +351,14 @@ def status(
     elif server is not None and not mcp_registered:
         drifts.append("mcp-server-not-owned")
 
-    if not installed_events and not mcp_registered:
+    if not installed_events and not mcp_registered and not skill_installed:
         state = ClaudeIntegrationState.NOT_INSTALLED
-    elif sorted(installed_events) == sorted(HOOK_EVENTS) and mcp_registered and not drifts:
+    elif (
+        sorted(installed_events) == sorted(HOOK_EVENTS)
+        and mcp_registered
+        and skill_installed
+        and not drifts
+    ):
         state = ClaudeIntegrationState.INSTALLED
     else:
         state = ClaudeIntegrationState.DRIFTED
@@ -270,6 +366,8 @@ def status(
         drifts.extend(f"missing-event:{event}" for event in missing)
         if not mcp_registered:
             drifts.append("mcp-server-not-registered")
+        if not skill_installed and (installed_events or mcp_registered):
+            drifts.append("skill-not-installed")
 
     installed_version = versions.pop() if len(versions) == 1 else None
     return ClaudeIntegrationStatus(
@@ -280,6 +378,7 @@ def status(
         hook_events=tuple(sorted(installed_events)),
         mcp_registered=mcp_registered,
         foreign_hook_handlers=_count_foreign_handlers(settings),
+        skill_installed=skill_installed,
         drifts=tuple(dict.fromkeys(drifts)),
     )
 
@@ -288,8 +387,9 @@ def install(
     *,
     settings_path: Path | None = None,
     python_executable: Path | None = None,
+    skill_path: Path | None = None,
 ) -> ClaudeIntegrationStatus:
-    """Add htsave's hooks and MCP server, leaving every foreign entry intact."""
+    """Add htsave's hooks, MCP server, and skill, leaving every foreign entry intact."""
 
     path = settings_path or default_settings_path()
     interpreter = (python_executable or Path(sys.executable)).expanduser()
@@ -314,8 +414,11 @@ def install(
     servers[PLUGIN_NAME] = _mcp_server(interpreter)
     settings["mcpServers"] = servers
 
+    _install_skill(skill_path, settings_path=path)
     _write_settings(path, settings)
-    result = status(settings_path=path, python_executable=interpreter)
+    result = status(
+        settings_path=path, python_executable=interpreter, skill_path=skill_path
+    )
     if result.foreign_hook_handlers != foreign_before:
         raise ClaudeIntegrationError(
             "install changed the operator's own hook handlers; settings were not preserved"
@@ -332,12 +435,15 @@ def uninstall(
     settings_path: Path | None = None,
     python_executable: Path | None = None,
     confirm: bool = False,
+    skill_path: Path | None = None,
 ) -> dict[str, Any]:
     """Remove only htsave-owned entries.  Session data is never touched."""
 
     path = settings_path or default_settings_path()
     interpreter = (python_executable or Path(sys.executable)).expanduser()
-    before = status(settings_path=path, python_executable=interpreter)
+    before = status(
+        settings_path=path, python_executable=interpreter, skill_path=skill_path
+    )
     if not confirm:
         return {
             "dry_run": True,
@@ -349,7 +455,10 @@ def uninstall(
 
     settings = _strip_owned(_read_settings(path))
     _write_settings(path, settings)
-    after = status(settings_path=path, python_executable=interpreter)
+    _uninstall_skill(skill_path, settings_path=path)
+    after = status(
+        settings_path=path, python_executable=interpreter, skill_path=skill_path
+    )
     if after.foreign_hook_handlers != before.foreign_hook_handlers:
         raise ClaudeIntegrationError(
             "uninstall changed the operator's own hook handlers; settings were not preserved"

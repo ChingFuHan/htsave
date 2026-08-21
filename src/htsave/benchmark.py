@@ -22,6 +22,7 @@ REQUIRED_SCENARIOS = (
     "repeated_test_output",
     "multi_round_context",
 )
+REQUIRED_PAIRS = 10
 
 # Which htsave delivery path the treatment arm exercises.  ``mcp`` drives the
 # explicit ``htsave_read``/``htsave_hydrate`` tools that Codex supports today;
@@ -31,12 +32,16 @@ BenchmarkPath = Literal["mcp", "shell"]
 BENCHMARK_PATHS: tuple[BenchmarkPath, ...] = ("mcp", "shell")
 DEFAULT_BENCHMARK_PATH: BenchmarkPath = "mcp"
 
-# Which agent CLI is measured.  Claude Code is the default because it is the
-# only host whose transparent path can run at all.
-Host = Literal["claude", "codex"]
-BENCHMARK_HOSTS: tuple[Host, ...] = ("claude", "codex")
+# Which agent CLI is measured.  Claude Code is the default for the transparent
+# path; Codex and agy exercise the explicit MCP path they support today.
+Host = Literal["agy", "claude", "codex"]
+BENCHMARK_HOSTS: tuple[Host, ...] = ("agy", "claude", "codex")
 DEFAULT_HOST: Host = "claude"
-DEFAULT_PATH_FOR_HOST: dict[Host, BenchmarkPath] = {"claude": "shell", "codex": "mcp"}
+DEFAULT_PATH_FOR_HOST: dict[Host, BenchmarkPath] = {
+    "agy": "mcp",
+    "claude": "shell",
+    "codex": "mcp",
+}
 
 _USAGE_FIELDS = (
     "input_tokens",
@@ -59,7 +64,13 @@ class CodexExecProtocolError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class Usage:
-    """Actual token usage reported by a completed Codex turn."""
+    """Host-reported input/output usage for one completed attempt.
+
+    Codex reports cached input as a component of ``input_tokens``. Claude Code
+    reports aggregate uncached input separately from cache reads, so
+    ``cached_input_tokens`` is not required to be a subset of
+    ``input_tokens`` for every host.
+    """
 
     input_tokens: int
     cached_input_tokens: int
@@ -71,8 +82,6 @@ class Usage:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
-        if self.cached_input_tokens > self.input_tokens:
-            raise ValueError("cached_input_tokens cannot exceed input_tokens")
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +201,8 @@ def _parse_usage(value: object, line_number: int) -> Usage:
             f"line {line_number}: usage missing required fields: {', '.join(missing)}"
         )
     try:
+        if value["cached_input_tokens"] > value["input_tokens"]:
+            raise ValueError("cached_input_tokens cannot exceed input_tokens")
         return Usage(**{name: value[name] for name in _USAGE_FIELDS})
     except ValueError as exc:
         raise CodexExecProtocolError(f"line {line_number}: {exc}") from exc
@@ -243,7 +254,7 @@ class ScenarioReport:
 
     scenario_id: str
     pairs: tuple[PairwiseResult, ...]
-    required_pairs: int = 5
+    required_pairs: int = REQUIRED_PAIRS
     threshold: Fraction = Fraction(3, 10)
     median_input_reduction: Fraction | None = field(init=False)
     passed: bool = field(init=False)
@@ -282,7 +293,7 @@ def evaluate_scenario(
     scenario_id: str,
     pairs: Iterable[PairwiseResult],
     *,
-    required_pairs: int = 5,
+    required_pairs: int = REQUIRED_PAIRS,
     threshold: Fraction = Fraction(3, 10),
 ) -> ScenarioReport:
     """Build the exact median release gate for one scenario."""
@@ -337,12 +348,13 @@ def evaluate_benchmark(
 def parse_claude_exec_json(payload: str) -> ProtocolResult:
     """Parse one public ``claude -p --output-format json`` result object.
 
-    Claude Code reports usage per assistant turn under ``usage.iterations``,
-    and the top-level counters describe only the final turn.  A repeated-context
-    benchmark must compare what the whole session was charged, so every
-    iteration is summed.  Cache reads are counted as input (they are billed and
-    are disjoint from ``input_tokens`` here) and additionally reported on their
-    own, never subtracted.
+    Claude Code's result envelope contains two granularities. The top-level
+    ``usage``/``iterations`` values describe the final request, while
+    ``modelUsage`` aggregates the complete print session. Use the latter when
+    available so paired measurements cover all tool rounds. Its uncached
+    ``inputTokens`` field is the release metric; cache reads remain a separate
+    diagnostic value and are not added to it. Older envelopes without
+    ``modelUsage`` fall back to summing their iterations.
     """
 
     try:
@@ -379,6 +391,35 @@ def parse_claude_exec_json(payload: str) -> ProtocolResult:
         # then already describe the whole session.
         iterations = [usage_value]
 
+    model_usage = result.get("modelUsage")
+    if isinstance(model_usage, dict) and model_usage:
+        totals = Counter()
+        for model_name, model_value in model_usage.items():
+            if not isinstance(model_name, str) or not isinstance(model_value, dict):
+                raise CodexExecProtocolError("claude modelUsage entries must be objects")
+            for field_name in (
+                "inputTokens",
+                "cacheReadInputTokens",
+                "outputTokens",
+            ):
+                value = model_value.get(field_name, 0)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise CodexExecProtocolError(
+                        f"claude modelUsage field {field_name} must be a non-negative integer"
+                    )
+                totals[field_name] += value
+        return ProtocolResult(
+            thread_id=session_id,
+            terminal="completed",
+            usage=Usage(
+                input_tokens=totals["inputTokens"],
+                cached_input_tokens=totals["cacheReadInputTokens"],
+                output_tokens=totals["outputTokens"],
+                reasoning_output_tokens=0,
+            ),
+            event_counts=MappingProxyType({"modelUsage": len(model_usage)}),
+        )
+
     totals = Counter()
     for index, iteration in enumerate(iterations, start=1):
         if not isinstance(iteration, dict):
@@ -409,4 +450,78 @@ def parse_claude_exec_json(payload: str) -> ProtocolResult:
         terminal="completed",
         usage=usage,
         event_counts=MappingProxyType({"usage.iterations": len(iterations)}),
+    )
+
+
+def parse_agy_exec_json(payload: str) -> ProtocolResult:
+    """Parse agy's public ``--output-format stream-json`` result stream."""
+
+    event_counts: Counter[str] = Counter()
+    errors: list[str] = []
+    result_value: Mapping[str, object] | None = None
+    for line_number, line in enumerate(payload.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CodexExecProtocolError(f"line {line_number}: malformed JSON: {exc.msg}") from exc
+        if not isinstance(event, dict):
+            raise CodexExecProtocolError(f"line {line_number}: event must be an object")
+        event_name = event.get("event")
+        if not isinstance(event_name, str) or not event_name:
+            raise CodexExecProtocolError(f"line {line_number}: event name must be a string")
+        event_counts[event_name] += 1
+        if event_name == "error":
+            errors.append(_event_error(event, "agy error"))
+        if event_name == "result":
+            value = event.get("result")
+            if not isinstance(value, dict):
+                raise CodexExecProtocolError(f"line {line_number}: agy result must be an object")
+            if result_value is not None:
+                raise CodexExecProtocolError("duplicate agy result event")
+            result_value = value
+
+    if result_value is None:
+        raise CodexExecProtocolError("missing agy result event")
+    conversation_id = result_value.get("conversation_id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        raise CodexExecProtocolError("agy result is missing conversation_id")
+    status = result_value.get("status")
+    if status != "SUCCESS":
+        detail = result_value.get("error") or status or "unknown"
+        errors.append(f"agy terminal state: {detail}")
+        return ProtocolResult(
+            thread_id=conversation_id,
+            terminal="failed",
+            usage=None,
+            event_counts=event_counts,
+            errors=tuple(errors),
+        )
+    usage_value = result_value.get("usage")
+    if not isinstance(usage_value, dict):
+        raise CodexExecProtocolError("agy result is missing usage")
+
+    def count(name: str, *, required: bool = False) -> int:
+        value = usage_value.get(name)
+        if value is None and not required:
+            return 0
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise CodexExecProtocolError(
+                f"agy usage field {name} must be a non-negative integer"
+            )
+        return value
+
+    usage = Usage(
+        input_tokens=count("input_tokens", required=True),
+        cached_input_tokens=count("cache_read_tokens"),
+        output_tokens=count("output_tokens", required=True),
+        reasoning_output_tokens=count("thinking_tokens"),
+    )
+    return ProtocolResult(
+        thread_id=conversation_id,
+        terminal="completed",
+        usage=usage,
+        event_counts=event_counts,
+        errors=tuple(errors),
     )

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 import htsave.benchmark_runner as runner_module
-from htsave.benchmark import CodexExecProtocolError, parse_claude_exec_json
+from htsave.benchmark import CodexExecProtocolError, Usage, parse_claude_exec_json
 from htsave.benchmark_runner import (
     ProcessOutput,
     ProcessRequest,
@@ -33,9 +33,9 @@ def _result(
     answer: str,
     session_id: str = "sess-1",
     completed: bool = True,
+    model_usage: dict[str, dict[str, int]] | None = None,
 ) -> str:
-    return json.dumps(
-        {
+    payload: dict[str, object] = {
             "type": "result",
             "session_id": session_id,
             "is_error": not completed,
@@ -50,7 +50,9 @@ def _result(
                 "iterations": iterations,
             },
         }
-    )
+    if model_usage is not None:
+        payload["modelUsage"] = model_usage
+    return json.dumps(payload)
 
 
 def test_usage_is_summed_across_turns_not_taken_from_the_last_one() -> None:
@@ -69,6 +71,25 @@ def test_usage_is_summed_across_turns_not_taken_from_the_last_one() -> None:
     assert protocol.usage.input_tokens == 250
     assert protocol.usage.cached_input_tokens == 90
     assert protocol.usage.output_tokens == 8
+
+
+def test_model_usage_aggregates_the_full_claude_session() -> None:
+    payload = _result(
+        iterations=[{"input_tokens": 8, "cache_read_input_tokens": 900}],
+        model_usage={
+            "claude-haiku-4-5-20251001": {
+                "inputTokens": 120,
+                "cacheReadInputTokens": 350,
+                "outputTokens": 17,
+            }
+        },
+        answer="{}",
+    )
+
+    protocol = parse_claude_exec_json(payload)
+
+    assert protocol.usage == Usage(120, 350, 17, 0)
+    assert protocol.event_counts["modelUsage"] == 1
 
 
 def test_single_turn_results_without_a_breakdown_still_parse() -> None:
@@ -170,7 +191,7 @@ class FakeClaude:
         )
 
 
-def test_fake_claude_runs_all_40_slots_with_arm_specific_isolated_configs(
+def test_fake_claude_runs_all_80_slots_with_arm_specific_isolated_configs(
     tmp_path: Path,
 ) -> None:
     fake = FakeClaude()
@@ -185,11 +206,11 @@ def test_fake_claude_runs_all_40_slots_with_arm_specific_isolated_configs(
         host="claude",
     )
 
-    assert len(fake.requests) == 40
-    assert manifest.completed_count == 40
+    assert len(fake.requests) == 80
+    assert manifest.completed_count == 80
     assert manifest.release_report().passed
     assert len({request.argv for request in fake.requests}) == 1
-    assert len({request.isolated_home for request in fake.requests}) == 40
+    assert len({request.isolated_home for request in fake.requests}) == 80
 
     # The treatment arm is exactly "htsave's hooks are installed".
     treatment = [
@@ -202,7 +223,7 @@ def test_fake_claude_runs_all_40_slots_with_arm_specific_isolated_configs(
         for settings, request in zip(fake.settings, fake.requests, strict=True)
         if request.arm == "baseline"
     ]
-    assert len(treatment) == len(baseline) == 20
+    assert len(treatment) == len(baseline) == 40
     assert all(settings == {} for settings in baseline)
     for settings in treatment:
         commands = [
@@ -263,8 +284,8 @@ def test_a_bounded_first_run_stops_early_and_resume_finishes_the_rest(
         process_runner=fake,
     )
 
-    assert len(fake.requests) == 40
-    assert finished.completed_count == 40
+    assert len(fake.requests) == 80
+    assert finished.completed_count == 80
     assert finished.release_report().passed
 
 

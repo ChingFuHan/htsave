@@ -31,15 +31,26 @@ tools 才能節省 token，因為 Codex 目前沒有支援替換 tool 結果的�
 ```bash
 uv tool install htsave
 
-htsave claude install    # Claude Code：將 hook + MCP server 安裝至 settings.json
+htsave claude install    # Claude Code：將 hook + MCP server + skill 安裝至 settings.json
 htsave codex install     # Codex CLI：透過 managed plugin marketplace 安裝
+htsave agy install       # Antigravity CLI：將 skill + MCP + hooks 安裝至 ~/.gemini/config/
 htsave doctor
 ```
 
-安裝與移除皆為冪等操作，且 `htsave claude install` 只會新增標記為自身所有的項目
-— 你 `settings.json` 中現有的 hook 和 MCP server 會被完整保留。兩個 `uninstall`
-指令在未提供 `--yes` 時都會預覽變更，且永遠不會移除 session 資料。`gc` 在未加
-`--apply` 時為 dry-run；`clear` 在未加 `--yes` 時為 dry-run。
+安裝與移除皆為冪等操作，且 `htsave claude install` 與 `htsave agy install` 只會
+新增標記為自身所有的項目 — 你的配置中現有的 hook 和 MCP server 會被完整保留。所有
+`uninstall` 指令在未提供 `--yes` 時都會預覽變更，且永遠不會移除 session 資料。`gc`
+在未加 `--apply` 時為 dry-run；`clear` 在未加 `--yes` 時為 dry-run。
+
+## Skill 指令
+
+在 Claude Code 上，`/htsave` 會啟用 skill — 它告知 model 關於 HTSAVE/1
+transport frame 以及如何在需要完整位元組時呼叫 `htsave_hydrate`。在 Codex CLI
+上，`$htsave` 有相同功能。在 Antigravity CLI 上，skill 會從
+`~/.gemini/config/skills/htsave/` 自動發現。
+
+Skill 會在執行 `htsave claude install`、`htsave codex install` 和
+`htsave agy install` 時自動安裝。
 
 ## 執行路徑
 
@@ -70,18 +81,55 @@ SHA-256 session key 分隔。每個 session 有一個不可變的 CAS 和 SQLite
 registry。POSIX 狀態使用 `0700` 目錄和 `0600` 檔案權限；Windows 狀態限制為
 當前使用者。沒有自動 GC 或跨 session 重用。
 
+## 實機 benchmark 證據
+
+Benchmark 已完成 Codex CLI、Claude Code 與 Antigravity agy 各 80/80 次執行
+（共 240 次實機執行；每個情境各 10 組 baseline/treatment 對照）。下表的
+baseline/treatment 是該情境 10 組對照的 `input_tokens` 總和；正式 gate
+使用十組 pairwise 節省比例的中位數。cached input 另行記錄，不從
+`input_tokens` 扣除。原始 manifest 位於量測主機的
+`/tmp/htsave-live-codex-luna-v14/manifest.json`、
+`/tmp/htsave-live-claude-v6/manifest.json` 與
+`/tmp/htsave-live-agy-v2/manifest.json`。
+
+| 平台 | 測試模型 | 交付路徑 | 情境 | 10 組 baseline input 總和 | 10 組 treatment input 總和 | pairwise 節省中位數 | Gate |
+| :--- | :--- | :--- | :--- | ---: | ---: | ---: | :--- |
+| **Codex CLI** | `gpt-5.6-luna` (low) | 顯式 MCP | `large_readme_exact` | 2,508,942 | 1,463,038 | **41.69%** | ✅ 通過 |
+| **Codex CLI** | `gpt-5.6-luna` (low) | 顯式 MCP | `source_three_line_delta` | 2,801,927 | 1,777,972 | **36.57%** | ✅ 通過 |
+| **Codex CLI** | `gpt-5.6-luna` (low) | 顯式 MCP | `repeated_test_output` | 2,194,297 | 1,372,861 | **39.94%** | ✅ 通過 |
+| **Codex CLI** | `gpt-5.6-luna` (low) | 顯式 MCP | `multi_round_context` | 3,281,050 | 2,631,954 | **30.43%** | ✅ 通過 |
+| **Claude Code** | `claude-haiku-4-5-20251001` | 透明 shell | `large_readme_exact` | 12,760 | 658 | **94.91%** | ✅ 通過 |
+| **Claude Code** | `claude-haiku-4-5-20251001` | 透明 shell | `source_three_line_delta` | 13,194 | 930 | **93.22%** | ✅ 通過 |
+| **Claude Code** | `claude-haiku-4-5-20251001` | 透明 shell | `repeated_test_output` | 13,076 | 890 | **93.43%** | ✅ 通過 |
+| **Claude Code** | `claude-haiku-4-5-20251001` | 透明 shell | `multi_round_context` | 13,306 | 1,090 | **92.40%** | ✅ 通過 |
+| **agy** | `gemini-3.7-flash-low` | 顯式 MCP | `large_readme_exact` | 765,338 | 804,254 | **−18.69%** | ❌ 紅燈 |
+| **agy** | `gemini-3.7-flash-low` | 顯式 MCP | `source_three_line_delta` | 896,518 | 698,395 | **26.07%** | ❌ 紅燈 |
+| **agy** | `gemini-3.7-flash-low` | 顯式 MCP | `repeated_test_output` | 782,637 | 855,713 | **−0.78%** | ❌ 紅燈 |
+| **agy** | `gemini-3.7-flash-low` | 顯式 MCP | `multi_round_context` | 1,045,462 | 1,062,161 | **1.96%** | ❌ 紅燈 |
+
+`gpt-5.6-luna` 與 `gemini-3.7-flash-low` 是各次本地選用的模型。本專案不
+宣稱任何官方公開定價。Codex 與 Claude 的執行全部完成且通過 deterministic
+oracle；Claude 四個節省 gate 全部達到 30%（92–95% 區間）。agy 執行也全部
+完成且通過 oracle，但四個節省 gate 都未達 30%，這是有效的 red 實證結果，
+不是執行失敗。
+
+完整稽核清單、原始 manifest 路徑與重現指引請參閱 [verify.md](verify.md)。
+
+
+
 ## 操作指令
 
 ```text
 htsave claude install|uninstall|status
 htsave codex install|uninstall|status
+htsave agy install|uninstall|status
 htsave doctor
 htsave stats [--session-key KEY]
 htsave inspect [--session-key KEY]
 htsave hydrate REF --session-key KEY
 htsave gc [--apply]
 htsave clear (--session-key KEY | --all) [--yes]
-htsave benchmark run --output DIR [--host claude|codex] [--path mcp|shell]
+htsave benchmark run --output DIR [--host claude|codex|agy] [--path mcp|shell]
                      [--max-executions N] [--confirm-paid-runs]
 htsave benchmark run --output DIR --resume [--confirm-paid-runs]
 htsave benchmark report DIR/manifest.json
