@@ -84,6 +84,18 @@ PreToolUse `updatedInput` capability injection.
   (Manifest: `/tmp/htsave-live-agy-v2/manifest.json`)
 - No official model price is inferred. `gemini-3.7-flash-low` is only the local
   model selection for this run.
+- **Root cause (post-hoc analysis of events.jsonl):** htsave correctly
+  delivered REF frames on rounds 2–4 of each execution; the agy model followed
+  the skill instructions and called `htsave_hydrate` only once per session.
+  The red result is attributable to Gemini's server-side KV cache competing
+  with htsave deduplication on the `input_tokens` metric: baseline arms sending
+  repetitive full file content receive more cache hits (higher
+  `cached_input_tokens`, lower billed `input_tokens`), while treatment arms
+  sending compact REF tokens break the repetitive prefix pattern and receive
+  fewer cache hits. htsave correctly reduces bytes transmitted, but Gemini's
+  own caching handles repetition more effectively for billing purposes. This
+  is a limitation of measuring billed `input_tokens` on a host with
+  aggressive server-side KV caching, not a defect in htsave's implementation.
 
 
 ### Codex transparent PostToolUse path gate — externally blocked
