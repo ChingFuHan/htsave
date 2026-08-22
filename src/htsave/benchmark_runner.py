@@ -785,14 +785,17 @@ def _agy_argv(
 ) -> tuple[str, ...]:
     if path != "mcp":
         raise ValueError("the agy benchmark measures its explicit MCP path")
+    # --effort is a Gemini-specific flag; Claude and other vendors reject it.
+    effort_args: tuple[str, ...] = (
+        ("--effort", reasoning_effort) if model.startswith("gemini") else ()
+    )
     return (
         executable,
         "--output-format",
         "stream-json",
         "--model",
         model,
-        "--effort",
-        reasoning_effort,
+        *effort_args,
         "--json-schema",
         "answer.schema.json",
         "--dangerously-skip-permissions",

@@ -105,9 +105,20 @@ def test_agy_manifest_uses_stream_json_mcp_path() -> None:
     assert "--json-schema" in manifest.argv
     assert "--dangerously-skip-permissions" in manifest.argv
     assert "--add-dir" in manifest.argv
+    assert "--effort" in manifest.argv  # Gemini models support --effort
 
     with pytest.raises(ValueError, match="explicit MCP path"):
         build_release_manifest(host="agy", path="shell")
+
+
+def test_agy_manifest_omits_effort_for_non_gemini_model() -> None:
+    manifest = build_release_manifest(
+        codex_executable="fake-agy",
+        model="claude-sonnet-4-6",
+        host="agy",
+    )
+
+    assert "--effort" not in manifest.argv
 
 
 class FakeAgy:

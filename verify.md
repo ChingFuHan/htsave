@@ -207,13 +207,67 @@ rtk uv run htsave benchmark run \
 rtk uv run htsave benchmark report /tmp/htsave-reproduce-agy/manifest.json
 ```
 
+## Follow-up agy model experiments
+
+Two additional agy benchmark runs were executed to investigate whether the red
+result is Gemini-model-specific or a structural limitation of the explicit MCP
+path.
+
+### agy / gemini-3.1-pro-low
+
+Manifest: `/tmp/htsave-agy-pro-v1/manifest.json`  
+Model: `gemini-3.1-pro-low`  
+Result: **80/80 completed, 0 failed, report failed savings gate**
+
+| Scenario | Baseline input total | Treatment input total | Median reduction | Gate |
+| :--- | ---: | ---: | ---: | :--- |
+| `large_readme_exact` | 801,264,800 | ~699,567,403 | **12.69%** | ❌ red |
+| `source_three_line_delta` | 16,691,371,063 | ~8,606,980,930 | **48.44%** | ✅ pass |
+| `repeated_test_output` | 926,548,996 | ~556,850,343 | **39.90%** | ✅ pass |
+| `multi_round_context` | 3,529,722,620 | ~3,412,939,979 | **3.31%** | ❌ red |
+
+Two of four scenarios passed. The overall gate fails because `large_readme_exact`
+and `multi_round_context` did not reach 30%. Pro shows less KV-cache interference
+than flash-low (12.69% vs −18.69% for `large_readme_exact`), but the
+explicit-MCP hydration overhead remains the binding constraint: when the model
+calls `htsave_hydrate` the full content re-enters context, negating the REF
+savings on high-token scenarios. `gemini-3.1-pro-low` is only the local model
+selection for this run; no official price is inferred.
+
+### agy / claude-sonnet-4-6 (partial — quota-limited)
+
+Manifest: `/tmp/htsave-agy-claude-probe/manifest.json`  
+Model: `claude-sonnet-4-6`  
+Result: **28/80 completed; 52 blocked by 137-hour Anthropic API quota lock**
+
+| Scenario | Pairs completed | Median reduction | Gate |
+| :--- | ---: | ---: | :--- |
+| `large_readme_exact` | 10 | **2.27%** | ❌ red |
+| `source_three_line_delta` | 4 | **7.61%** | insufficient |
+| `repeated_test_output` | 0 | — | blocked |
+| `multi_round_context` | 0 | — | blocked |
+
+Claude has no Gemini server-side KV cache, yet savings for `large_readme_exact`
+are only ~2.27% — confirming that hydration overhead, not KV caching alone, is
+the binding root cause. All 10 `large_readme_exact` pairs are complete and give
+a statistically clear signal. The 52 remaining executions were blocked by an
+individual Anthropic API quota that resets in 137 hours; the partial manifest is
+retained as audit history. This partial run required a fix to
+`benchmark_runner._agy_argv` (`src/htsave/benchmark_runner.py`) to omit
+`--effort` for non-Gemini models, which reject that flag; a regression test was
+added in `tests/test_benchmark_agy.py`.
+
 ## Verification conclusion
 
 - Codex MCP live savings gate: **pass** (41.69%, 36.57%, 39.94%, 30.43%).
 - Claude transparent-shell live savings gate: **pass** (94.91%, 93.22%, 93.43%,
   92.40%); v6 manifest supersedes the earlier red v5 result.
-- agy MCP live savings gate: **red** (−18.69%, 26.07%, −0.78%, 1.96%) despite
-  80/80 correct executions; agy integration smoke gate: **pass**.
+- agy MCP live savings gate: **red** (gemini-3.7-flash-low: −18.69%, 26.07%,
+  −0.78%, 1.96%; gemini-3.1-pro-low: 12.69%, 48.44%, 39.90%, 3.31%; both
+  failed the overall gate); agy integration smoke gate: **pass**.
+- Root cause confirmed by claude-sonnet-4-6 partial run (10 pairs, 2.27%): the
+  explicit MCP path with mandatory hydration is the binding constraint, not
+  Gemini KV caching alone.
 - The local test/build gates must be read together with the command results
   above. The repository must not be labelled a fully green v1 release until
   the agy savings gate is resolved.
