@@ -111,7 +111,13 @@ baseline/treatment 是該情境 10 組對照的 `input_tokens` 總和；正式 g
 宣稱任何官方公開定價。Codex 與 Claude 的執行全部完成且通過 deterministic
 oracle；Claude 四個節省 gate 全部達到 30%（92–95% 區間）。agy 執行也全部
 完成且通過 oracle，但四個節省 gate 都未達 30%，這是有效的 red 實證結果，
-不是執行失敗。
+不是執行失敗。根因屬結構性限制：agy 的顯式 MCP 路徑要求 `htsave_hydrate`
+在每次 REF 傳遞時回傳完整內容，導致內容重新進入模型 context，抵消了位元組
+壓縮的效益。後續以 `claude-sonnet-4-6` 透過 agy 執行的補充實驗（無 Gemini
+KV cache）確認 `large_readme_exact` 中位數僅 2.27%，證明 hydration overhead
+——而非 Gemini KV cache——才是根本限制。Claude Code 透過
+`hookSpecificOutput.updatedToolOutput` 在模型看到結果前就完成替換，因此不受
+此限制；agy 目前沒有對等的 hook 合約。
 
 完整稽核清單、原始 manifest 路徑與重現指引請參閱 [verify.md](verify.md)。
 
