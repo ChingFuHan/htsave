@@ -1,9 +1,10 @@
 """Lifecycle hook adapter for Antigravity CLI (agy).
 
 agy hook contract (from ~/.gemini/config/hooks.json):
-- PreToolUse:  receives toolCall, can return {decision, overwrite}
-- PostToolUse: receives stepIdx + error, must return {}
-- Stop:        receives terminationReason, can return {decision: "continue"}
+- PreToolUse:     receives toolCall, can return {decision, overwrite}
+- PostToolUse:    receives stepIdx + error, must return {}
+- PreInvocation:  receives invocationNum, can return {injectSteps}
+- Stop:           receives terminationReason, can return {decision: "continue"}
 
 Key differences from Claude Code / Codex:
 - No SessionStart -> lazy init on first PreToolUse
@@ -29,6 +30,12 @@ from .registry import Registry
 
 _HTSAVE_READ = "mcp__htsave__htsave_read"
 _HTSAVE_HYDRATE = "mcp__htsave__htsave_hydrate"
+PRE_INVOCATION_REMINDER = (
+    "htsave: an HTSAVE/1 REF frame certifies byte-exact identity with content "
+    "already delivered in this conversation. Never call htsave_hydrate to "
+    "re-view a target whose FULL text was already delivered; hydrate only "
+    "when a required fact was never delivered."
+)
 
 
 def _read_stdin() -> dict[str, Any]:
@@ -45,6 +52,8 @@ def _write_stdout(payload: dict[str, Any]) -> None:
 
 def _detect_event(payload: dict[str, Any]) -> str:
     """Infer which agy lifecycle event triggered this hook."""
+    if "invocationNum" in payload or "initialNumSteps" in payload:
+        return "PreInvocation"
     if "toolCall" in payload or "tool_call" in payload:
         if any(key in payload for key in ("toolResult", "tool_result", "result", "error")):
             return "PostToolUse"
@@ -131,13 +140,6 @@ def _first_string(value: Mapping[str, Any], *names: str) -> str | None:
 
 
 def _workspace_path(payload: Mapping[str, Any]) -> str | None:
-    # Look for workspace in benchmark run directory
-    state_dir = os.environ.get("HTSAVE_STATE_DIR")
-    if state_dir:
-        parent = Path(state_dir).parent
-        workspaces = list(parent.glob("workspace-*"))
-        if workspaces:
-            return str(workspaces[0])
     paths = payload.get("workspacePaths") or payload.get("workspace_paths")
     if isinstance(paths, list):
         for path in paths:
@@ -156,8 +158,33 @@ def _handle_post_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
+    """Inject one ephemeral anti-rehydration reminder before the model runs.
+
+    REF frames already certify byte-exact identity; hydrating a previously
+    delivered FULL target re-enters its whole content into model context for
+    no informational gain.  Both benchmark arms receive identical hooks, so
+    this reminder is symmetric and fair.
+    """
+
+    return {"injectSteps": [{"ephemeralMessage": PRE_INVOCATION_REMINDER}]}
+
+
 def _handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
-    """Handle Stop: confirm pending receipts."""
+    """Confirm pending receipts at session end; the response stays empty."""
+
+    session_id = _first_string(payload, "conversationId", "conversation_id", "sessionId")
+    if session_id is None:
+        return {}
+    state_root_value = os.environ.get("HTSAVE_STATE_DIR")
+    state_root = Path(state_root_value) if state_root_value else None
+    try:
+        paths = build_state_paths(session_id, state_root)
+        with Registry(paths.database, paths.session_key) as registry:
+            registry.confirm_pending()
+    except Exception:
+        # Fail open: an unconfirmable registry must never block agy shutdown.
+        return {}
     return {}
 
 
@@ -170,6 +197,8 @@ def main() -> None:
             result = _handle_pre_tool_use(payload)
         elif event == "PostToolUse":
             result = _handle_post_tool_use(payload)
+        elif event == "PreInvocation":
+            result = _handle_pre_invocation(payload)
         elif event == "Stop":
             result = _handle_stop(payload)
         else:

@@ -44,6 +44,10 @@ def test_install_creates_skill_mcp_and_hooks(tmp_path: Path) -> None:
     )
     assert "htsave" in hooks
     assert hooks["htsave"]["htsaveOwned"]["owner"] == "htsave"
+    # PreInvocation is a flat handler list in the agy contract.
+    pre_invocation = hooks["htsave"]["PreInvocation"]
+    assert isinstance(pre_invocation, list) and pre_invocation
+    assert pre_invocation[0]["type"] == "command"
 
 
 def test_install_is_idempotent(tmp_path: Path) -> None:

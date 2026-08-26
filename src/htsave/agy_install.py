@@ -210,6 +210,9 @@ def _install_hooks(home: Path | None = None) -> None:
                 "hooks": [{"type": "command", "command": command, "timeout": 30}],
             }
         ],
+        # PreInvocation is a flat handler list in the agy contract; it has no
+        # tool matcher because it fires before every model call.
+        "PreInvocation": [{"type": "command", "command": command, "timeout": 30}],
         "Stop": [{"type": "command", "command": command, "timeout": 30}],
     }
     _write_json(path, config)
