@@ -118,13 +118,18 @@ each run. This project makes no claim about official public pricing. The Codex
 and Claude attempts all completed and passed the deterministic oracle; all four
 Claude median savings gates reached 30% (92–95% range). The agy attempts also
 all completed and passed the oracle, but none of the four agy medians reached
-30%; that is a valid red empirical result, not an execution failure. The root
-cause is structural: agy's explicit MCP path requires `htsave_hydrate` to return
-the full content on every REF delivery, so the content re-enters the model
-context and negates the byte reduction. A follow-up run with `claude-sonnet-4-6`
-via agy (no Gemini KV cache) confirmed a median of only 2.27% for
-`large_readme_exact`, establishing hydration overhead — not Gemini KV caching
-alone — as the binding constraint. Claude Code avoids this through
+30%; that is a valid red empirical result, not an execution failure. A
+turn-level forensic decomposition of `events.jsonl` (see `verify.md`) traces
+the red gate to agy's architecture itself: agy spills large tool outputs to
+brain files so only summaries enter model context, and Gemini's server-side KV
+cache absorbs the remaining repetition, so neither arm ever re-bills full
+content. The gate metric (uncached `input_tokens`) is therefore dominated by
+which arm draws KV-cache misses, with pair-level swings far larger than any
+transport effect; mandatory hydration on the explicit MCP path is a secondary
+factor — v3 removed it entirely via skill discipline plus a PreInvocation
+reminder, lifting `large_readme_exact` by +14.92 points (−18.69% → −3.77%)
+across a fresh 80/80 run while every median stayed red. Claude Code avoids all
+of this through
 `hookSpecificOutput.updatedToolOutput`, which replaces the tool result before the
 model sees it; agy has no equivalent hook contract.
 

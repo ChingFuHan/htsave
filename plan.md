@@ -183,4 +183,9 @@ rtk uv build
   中位數 -18.69%–26.07%，report failed savings gate；所有答案仍通過 oracle。
   此為有效的 red 實證結果，非執行失敗。（偏差：原計畫假設 agy 僅做 smoke
   check；實際已實作 agy benchmark host 並完成 80 次實機執行。）
+- agy MCP v3（零 hydrate 重跑）: `/tmp/htsave-agy-v3/manifest.json`
+  80/80 完成，`large_readme_exact` 中位數 −18.69%→−3.77%（+14.92 點），
+  四個 gate 仍紅；`/tmp/htsave-agy-pro-v2/manifest.json` 於 agy 1.1.20
+  中途撞個人 quota、以間隔 resume 補跑。逐回合鑑識、工程修復與最終表格
+  詳見 [verify.md](verify.md) 的「agy red-gate forensics」。
 - 文件與驗證命令結果集中於 [verify.md](verify.md)。

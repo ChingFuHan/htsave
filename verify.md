@@ -248,14 +248,86 @@ Result: **28/80 completed; 52 blocked by 137-hour Anthropic API quota lock**
 | `multi_round_context` | 0 | — | blocked |
 
 Claude has no Gemini server-side KV cache, yet savings for `large_readme_exact`
-are only ~2.27% — confirming that hydration overhead, not KV caching alone, is
-the binding root cause. All 10 `large_readme_exact` pairs are complete and give
-a statistically clear signal. The 52 remaining executions were blocked by an
-individual Anthropic API quota that resets in 137 hours; the partial manifest is
-retained as audit history. This partial run required a fix to
-`benchmark_runner._agy_argv` (`src/htsave/benchmark_runner.py`) to omit
+are only ~2.27% — consistent with the agy-side structural ceiling documented in
+the forensics below (agy's spill-plus-cache architecture bounds savings for
+every model, not only Gemini ones). All 10 `large_readme_exact` pairs are
+complete and give a statistically clear signal. The 52 remaining executions
+were blocked by an individual Anthropic API quota that resets in 137 hours; the
+partial manifest is retained as audit history. This partial run required a fix
+to `benchmark_runner._agy_argv` (`src/htsave/benchmark_runner.py`) to omit
 `--effort` for non-Gemini models, which reject that flag; a regression test was
 added in `tests/test_benchmark_agy.py`.
+
+## agy red-gate forensics (2026-08-26)
+
+A read-only decomposition of the recorded manifests' per-turn `events.jsonl`
+streams (`step_update.usage` per agent response) reattributed the red gate.
+Method and findings:
+
+1. **Neither arm ever re-bills full content on agy.** Large tool results are
+   spilled by agy to `.system_generated` brain files; the model context sees a
+   short summary (for example `view_file` returning `2053 lines, 238705
+   bytes`). Turn-level inputs stay at ~4–17k tokens in both arms even though
+   the fixture is ~239 KB. htsave's REF frames therefore replace summaries,
+   not billed content.
+2. **The gate metric is a KV-cache lottery.** Summing per-turn uncached input
+   reproduces the manifest totals exactly (example p00 treatment: 85,979 =
+   15,825+16,255+4,339+16,889+17,139+5,782+9,750). Baseline arms draw large
+   cached reads (up to 1,261,556 tokens on one pro-low arm) while treatment
+   arms draw misses on the same pairs; flash-low `large_readme_exact`
+   reductions range from −54.21% to +42.74% across pairs.
+3. **Hydration is secondary.** Counterfactually deleting every hydrate call's
+   tail turns moves flash-low medians only to −15.81%, +11.69%, +2.33%,
+   26.07% (from −18.69%, +1.96%, −0.78%, 26.07%). A discounted-cost view
+   (`input + 0.25 × cached`) is also negative (−32.76% median on
+   `large_readme_exact`), so no accounting of these runs shows agy savings.
+4. **Engineering hardening verified live.** `agy_hooks._handle_stop` now
+   confirms pending receipts (previously a no-op); the benchmark-only
+   `workspace-*` glob was removed from `_workspace_path`; the agy skill and a
+   new official-contract `PreInvocation` hook inject an anti-rehydration
+   reminder symmetrically in both arms.
+
+### v3 zero-hydrate rerun — gemini-3.7-flash-low, agy 1.1.20
+
+Manifest: `/tmp/htsave-agy-v3/manifest.json`, **80/80 completed**, every
+completed attempt passed the deterministic oracle, treatment sessions called
+`htsave_hydrate` zero times (v2: once per session), and Stop confirmed every
+receipt. Individual Gemini quota interruptions were retried under the same
+pair/arm ids with spaced `--resume --max-executions 2` passes; all retry
+attempts remain in the manifest audit history.
+
+| Scenario | Median input reduction | Gate |
+| :--- | ---: | :--- |
+| `large_readme_exact` | **−3.77%** | ❌ red |
+| `source_three_line_delta` | **22.80%** | ❌ red |
+| `repeated_test_output` | **−0.43%** | ❌ red |
+| `multi_round_context` | **−4.32%** | ❌ red |
+
+Versus v2 medians: `large_readme_exact` improved by +14.92 points
+(−18.69% → −3.77%), confirming the forensic attribution that hydration was
+the largest controllable loss; the other scenarios moved within noise
+(+0.35, −3.27, −6.28 points). No scenario approached the 30% gate, which
+matches the structural conclusion: after removing hydration, the remaining
+variance is Gemini KV-cache draw, not transport behavior.
+
+### v3 pro rerun — gemini-3.1-pro-low, agy 1.1.20
+
+Manifest: `/tmp/htsave-agy-pro-v2/manifest.json`, **80/80 completed** after
+spaced `--resume` passes through individual Gemini quota windows; every failed
+attempt is retained in the manifest audit history.
+
+| Scenario | Median input reduction | versus v1 | Gate |
+| :--- | ---: | ---: | :--- |
+| `large_readme_exact` | **7.02%** | −5.67 pts | ❌ red |
+| `source_three_line_delta` | **43.78%** | −4.66 pts | ✅ pass |
+| `repeated_test_output` | **10.52%** | −29.38 pts | ❌ red |
+| `multi_round_context` | **11.29%** | +7.98 pts | ❌ red |
+
+The overall gate stays red, and pair-level swings grew if anything wider
+(−101.7% to +84.9% within single scenarios), reconfirming that KV-cache draw
+dominates once hydration is removed. Pro never called `htsave_hydrate` in
+either run, so these deltas are pure cache-lottery noise plus model variance,
+not transport behavior.
 
 ## Verification conclusion
 
@@ -265,9 +337,13 @@ added in `tests/test_benchmark_agy.py`.
 - agy MCP live savings gate: **red** (gemini-3.7-flash-low: −18.69%, 26.07%,
   −0.78%, 1.96%; gemini-3.1-pro-low: 12.69%, 48.44%, 39.90%, 3.31%; both
   failed the overall gate); agy integration smoke gate: **pass**.
-- Root cause confirmed by claude-sonnet-4-6 partial run (10 pairs, 2.27%): the
-  explicit MCP path with mandatory hydration is the binding constraint, not
-  Gemini KV caching alone.
+- Root cause refined by the 2026-08-26 forensics: agy's spill-plus-KV-cache
+  architecture leaves nothing measurable for the explicit MCP path to save;
+  hydration was a secondary factor and has been eliminated in v3 (flash-low
+  `large_readme_exact` −18.69% → −3.77%, all four medians still red; pro-low
+  80/80 rerun also red with one scenario pass). The red gate is structural
+  while agy exposes no transparent replacement contract.
 - The local test/build gates must be read together with the command results
   above. The repository must not be labelled a fully green v1 release until
-  the agy savings gate is resolved.
+  the agy savings gate is resolved or agy is reclassified as an unsupported
+  host for this gate.

@@ -111,13 +111,18 @@ baseline/treatment 是該情境 10 組對照的 `input_tokens` 總和；正式 g
 宣稱任何官方公開定價。Codex 與 Claude 的執行全部完成且通過 deterministic
 oracle；Claude 四個節省 gate 全部達到 30%（92–95% 區間）。agy 執行也全部
 完成且通過 oracle，但四個節省 gate 都未達 30%，這是有效的 red 實證結果，
-不是執行失敗。根因屬結構性限制：agy 的顯式 MCP 路徑要求 `htsave_hydrate`
-在每次 REF 傳遞時回傳完整內容，導致內容重新進入模型 context，抵消了位元組
-壓縮的效益。後續以 `claude-sonnet-4-6` 透過 agy 執行的補充實驗（無 Gemini
-KV cache）確認 `large_readme_exact` 中位數僅 2.27%，證明 hydration overhead
-——而非 Gemini KV cache——才是根本限制。Claude Code 透過
-`hookSpecificOutput.updatedToolOutput` 在模型看到結果前就完成替換，因此不受
-此限制；agy 目前沒有對等的 hook 合約。
+不是執行失敗。對 `events.jsonl` 的逐回合鑑識（詳見 `verify.md`）把根因收斂
+到 agy 的架構本身：agy 會把大型工具輸出溢出（spill）到 brain 檔案、只讓
+摘要進入模型 context，加上 Gemini 伺服器端 KV cache 吸收重複內容，兩臂都
+從未真正重新計費全文。因此 gate 指標（未命中快取的 `input_tokens`）由「哪
+一臂抽到 KV cache 失誤」主導，pair 層級擺盪遠大於任何傳輸層效果；
+`htsave_hydrate` 的全文回灌只是次要因素——v3 已透過 skill 與 PreInvocation
+提醒把每次 session 的 hydrate 從 1 次降為 0 次，80/80 重跑讓
+`large_readme_exact` 中位數從 −18.69% 回升到 −3.77%（+14.92 點），但其餘
+情境在雜訊範圍內，四個 gate 仍全數紅燈，印證結構性結論。Claude
+Code 透過 `hookSpecificOutput.updatedToolOutput` 在模型看到結果前就完成替換，
+因此不受此限制；agy 目前沒有對等的 hook 合約，其節省 gate 在可預見的合約
+下維持紅燈。
 
 完整稽核清單、原始 manifest 路徑與重現指引請參閱 [verify.md](verify.md)。
 
