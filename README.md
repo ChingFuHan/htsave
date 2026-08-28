@@ -125,13 +125,17 @@ Claude Code already de-duplicates an identical re-`Read` of an unchanged file on
 its own, so htsave earns its keep on repeated command output, repeated MCP
 results, and re-reads of files that changed slightly.
 
-On **Codex CLI**, only the MCP tools save tokens. Codex 0.148.0 provides no
-supported successful arbitrary-result replacement response for PostToolUse, so
-there the PostToolUse adapter is observer-only: it ingests unambiguous text and
-returns `{}` so the original result is preserved. It does not use `block`,
-`continue:false`, `updatedMCPToolOutput`, transcript parsing, hosted-tool
-interception, or a wire/app-server proxy. That remains an explicit release gate
-until Codex publishes the contract.
+On **Codex CLI**, only the MCP tools save tokens. The adapter treats a parseable
+Codex version as an opportunity to try the documented hook contract and
+validates each event's required fields, so additive Codex updates do not require
+an htsave reinstall. `PreToolUse.updatedInput` carries the one-use MCP
+capability; malformed or changed events fail open. Codex still has no supported
+successful arbitrary-result replacement response for `PostToolUse`, so that
+adapter remains observer-only and returns `{}` to preserve the original result.
+It does not use `block`, `continue:false`, `updatedMCPToolOutput`, transcript
+parsing, hosted-tool interception, or a wire/app-server proxy. Transparent
+replacement remains an explicit release gate until Codex publishes the
+contract.
 
 All state is local below the platform user-data directory (override with
 `HTSAVE_STATE_DIR`), split by a SHA-256 session key. Each session has an

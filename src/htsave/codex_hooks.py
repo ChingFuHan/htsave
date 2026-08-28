@@ -1,4 +1,4 @@
-"""Fail-open Codex 0.148.0 lifecycle adapter.
+"""Fail-open, version-independent Codex lifecycle adapter.
 
 The domain engine deliberately has no knowledge of Codex hook JSON.  This
 module is the compatibility boundary: it validates the documented event
@@ -17,11 +17,7 @@ from typing import Any, Final, TextIO, TypeAlias
 
 from .capabilities import canonical_arguments_hash, issue_session_capability
 from .cas import ContentAddressedStore
-from .compat import (
-    SUPPORTED_CODEX_VERSION,
-    CodexCompatibility,
-    probe_codex_compatibility,
-)
+from .compat import CodexCompatibility, codex_compatibility_for_version, probe_codex_compatibility
 from .engine import ContextEngine
 from .errors import CompatibilityError
 from .hashing import sha256_id
@@ -208,7 +204,7 @@ def _permission_mode(value: Mapping[str, Any]) -> str:
     return _require_str(value, "permission_mode", allowed=_PERMISSION_MODES)
 
 
-def _parse_v0148(payload: object) -> HookEvent:
+def _parse_codex_hook(payload: object) -> HookEvent:
     value = _require_mapping(payload, "hook input")
     event_name = _require_str(value, "hook_event_name")
     common = _common(value, event_name)
@@ -280,18 +276,19 @@ def _parse_v0148(payload: object) -> HookEvent:
     raise CompatibilityError("unsupported Codex hook event")
 
 
-_EVENT_PARSERS: Final = {SUPPORTED_CODEX_VERSION: _parse_v0148}
-
-
 def parse_hook_event(
-    payload: object, *, contract_version: str = SUPPORTED_CODEX_VERSION
+    payload: object, *, contract_version: str | None = None
 ) -> HookEvent:
-    """Parse one documented hook event, accepting only additive unknown fields."""
+    """Parse one Codex hook event, accepting only additive unknown fields.
 
-    parser = _EVENT_PARSERS.get(contract_version)
-    if parser is None:
-        raise CompatibilityError("unsupported Codex hook contract version")
-    return parser(payload)
+    ``contract_version`` remains accepted for callers that recorded it, but
+    the parser is intentionally version-independent.  Required fields are the
+    capability boundary; a renamed or removed field still fails open in the
+    dispatch layer.
+    """
+
+    del contract_version
+    return _parse_codex_hook(payload)
 
 
 def _mcp_text(response: object) -> str | None:
@@ -420,7 +417,14 @@ def _session_start(
         }
 
 
-def _pre_tool_use(event: PreToolUseEvent, *, state_root: Path | None) -> dict[str, object]:
+def _pre_tool_use(
+    event: PreToolUseEvent,
+    *,
+    state_root: Path | None,
+    mcp_tool_injection: bool,
+) -> dict[str, object]:
+    if event.tool_name in _HTSAVE_MCP_TOOLS and not mcp_tool_injection:
+        return {}
     with _registry(event, state_root) as registry:
         if event.agent_id is not None:
             registry.subagent_started(event.agent_id, event.agent_type or "unknown")
@@ -472,9 +476,18 @@ def _post_tool_use(event: PostToolUseEvent, *, state_root: Path | None) -> None:
         )
 
 
-def _dispatch_compatible(event: HookEvent, *, state_root: Path | None) -> dict[str, object]:
+def _dispatch_compatible(
+    event: HookEvent,
+    *,
+    state_root: Path | None,
+    mcp_tool_injection: bool,
+) -> dict[str, object]:
     if isinstance(event, PreToolUseEvent):
-        return _pre_tool_use(event, state_root=state_root)
+        return _pre_tool_use(
+            event,
+            state_root=state_root,
+            mcp_tool_injection=mcp_tool_injection,
+        )
     if isinstance(event, PostToolUseEvent):
         _post_tool_use(event, state_root=state_root)
         return {}
@@ -500,6 +513,17 @@ def _dispatch_compatible(event: HookEvent, *, state_root: Path | None) -> dict[s
     raise CompatibilityError("unsupported compatible hook event")
 
 
+def _resolve_compatibility(
+    codex_version: str | object | None,
+    compatibility_probe: Callable[[], CodexCompatibility],
+) -> CodexCompatibility:
+    if codex_version is _VERSION_UNSET:
+        return compatibility_probe()
+    if not isinstance(codex_version, str):
+        return CodexCompatibility(None, False, "unknown-codex-version-output")
+    return codex_compatibility_for_version(codex_version)
+
+
 def dispatch_hook(
     payload: object,
     *,
@@ -511,29 +535,22 @@ def dispatch_hook(
 
     try:
         event = parse_hook_event(payload)
+        compatibility = _resolve_compatibility(codex_version, compatibility_probe)
         if isinstance(event, SessionStartEvent):
-            if event.source == "compact":
-                compatible = (
-                    compatibility_probe().supported
-                    if codex_version is _VERSION_UNSET
-                    else codex_version == SUPPORTED_CODEX_VERSION
-                )
-            else:
-                compatible = False
+            compatible = event.source == "compact" and compatibility.supported
             return _session_start(
                 event,
                 state_root=state_root,
                 compatible=compatible,
             )
 
-        compatible = (
-            compatibility_probe().supported
-            if codex_version is _VERSION_UNSET
-            else codex_version == SUPPORTED_CODEX_VERSION
-        )
-        if not compatible:
+        if not compatibility.supported:
             return {}
-        return _dispatch_compatible(event, state_root=state_root)
+        return _dispatch_compatible(
+            event,
+            state_root=state_root,
+            mcp_tool_injection=compatibility.mcp_tool_injection,
+        )
     except Exception:
         _mark_ambiguous_on_parse_failure(payload, state_root)
         return {}

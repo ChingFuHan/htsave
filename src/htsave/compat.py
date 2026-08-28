@@ -1,9 +1,10 @@
 """Host contract detection for fail-open adapter gates.
 
-Each supported host gets its own probe.  Codex CLI is pinned to one exact
-version because its hook contract is still moving; Claude Code is detected
-from the running binary's reported version and, unlike Codex, does provide a
-successful PostToolUse result-replacement response.
+Each supported host gets its own probe.  Codex CLI is treated like Caveman's
+native adapter: a parseable version enables the documented event adapter, and
+the event parser remains the final compatibility boundary.  Claude Code is
+detected from the running binary's reported version and, unlike Codex, does
+provide a successful PostToolUse result-replacement response.
 """
 
 from __future__ import annotations
@@ -14,11 +15,15 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-SUPPORTED_CODEX_VERSION = "0.148.0"
 # Claude Code has carried ``updatedToolOutput`` on PostToolUse since 2.x; the
 # floor is a minimum, not a pin, because the field is documented and stable.
 MINIMUM_CLAUDE_VERSION = (2, 1, 0)
-_VERSION = re.compile(r"^codex-cli ([0-9]+\.[0-9]+\.[0-9]+)$")
+_CODEX_SEMVER = re.compile(
+    r"^(?P<version>[0-9]+\.[0-9]+\.[0-9]+"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$"
+)
+_CODEX_VERSION_OUTPUT = re.compile(r"^codex-cli (?P<version>.+)$")
 _CLAUDE_VERSION = re.compile(r"^([0-9]+)\.([0-9]+)\.([0-9]+)\b")
 
 
@@ -30,19 +35,43 @@ class VersionCommandResult(Protocol):
 VersionRunner = Callable[[Sequence[str]], VersionCommandResult]
 
 
+def _parse_codex_version(value: str) -> str | None:
+    match = _CODEX_SEMVER.fullmatch(value.strip())
+    return match.group("version") if match is not None else None
+
+
 @dataclass(frozen=True, slots=True)
 class CodexCompatibility:
     detected_version: str | None
     supported: bool
     reason: str
-    # The currently supported stable hook contract is observer-only.  Keep
-    # this separate from ``supported`` so callers cannot mistake a safe
-    # fail-open adapter version for a transparent benchmark-capable version.
+    # Codex's supported hook contract is observer-only.  Keep this separate
+    # from ``supported`` so callers cannot mistake a safe fail-open adapter
+    # version for a transparent benchmark-capable version.
     posttool_result_replacement: bool = False
     # PreToolUse ``updatedInput`` injection plus MCP tool dispatch is the
-    # supported path on every compatible version, so the explicit
-    # ``htsave_read``/``htsave_hydrate`` benchmark can run today.
+    # supported path on every version whose event contract can be attempted.
     mcp_tool_injection: bool = False
+
+
+def codex_compatibility_for_version(version: str) -> CodexCompatibility:
+    """Build the version-independent Codex capability result.
+
+    A valid version only opts into trying the documented adapter.  Individual
+    hook events still validate their required fields and fail open when Codex
+    changes the event contract.
+    """
+
+    parsed = _parse_codex_version(version)
+    if parsed is None:
+        return CodexCompatibility(None, False, "unknown-codex-version-output")
+    return CodexCompatibility(
+        parsed,
+        True,
+        "capability-compatible",
+        posttool_result_replacement=False,
+        mcp_tool_injection=True,
+    )
 
 
 def _run_version(argv: Sequence[str]) -> VersionCommandResult:
@@ -58,19 +87,10 @@ def probe_codex_compatibility(
         return CodexCompatibility(None, False, "codex-version-probe-failed")
     if result.returncode != 0 or not isinstance(result.stdout, str):
         return CodexCompatibility(None, False, "codex-version-probe-failed")
-    match = _VERSION.fullmatch(result.stdout.strip())
+    match = _CODEX_VERSION_OUTPUT.fullmatch(result.stdout.strip())
     if match is None:
         return CodexCompatibility(None, False, "unknown-codex-version-output")
-    version = match.group(1)
-    if version != SUPPORTED_CODEX_VERSION:
-        return CodexCompatibility(version, False, "incompatible-codex-version")
-    return CodexCompatibility(
-        version,
-        True,
-        "supported",
-        posttool_result_replacement=False,
-        mcp_tool_injection=True,
-    )
+    return codex_compatibility_for_version(match.group("version"))
 
 
 @dataclass(frozen=True, slots=True)

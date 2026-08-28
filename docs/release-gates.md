@@ -60,8 +60,13 @@ supports both. `htsave doctor` reports every combination.
 The explicit `htsave_read` and `htsave_hydrate` tools, reached through
 PreToolUse `updatedInput` capability injection.
 
-- `probe_codex_compatibility` reports `mcp_tool_injection` for the installed
-  version, and `htsave benchmark run --path mcp` validates the supported contract.
+- `probe_codex_compatibility` reports `mcp_tool_injection` when the installed
+  Codex version is parseable, and the event parser remains the final
+  compatibility boundary. `htsave benchmark run --path mcp` validates the
+  supported contract.
+- Plugin `install`/`status` also runs the configured stdio interpreter through a
+  read-only `import htsave.mcp_server` check, reporting runtime drift instead
+  of claiming a healthy integration when MCP startup cannot import the server.
 - Verified live across all 4 scenarios (80/80 runs, 10 pairs each): all 4
   scenarios passed with 30.43% ~ 41.69% median pairwise input reduction against
   `gpt-5.6-luna` (Low), satisfying the release gate. `luna` is the local model
@@ -184,12 +189,13 @@ model is prompted.
 - A supported successful PostToolUse result-replacement contract exists and its
   real local contract test proves transparent FULL/REF/DELTA round trips.
 
-This condition is **blocked by Codex CLI 0.148.0 and 0.149.0-alpha.4**: neither
-provides a successful arbitrary-result replacement response. The observer hook
-must not use `block`, `continue:false`, or unsupported `updatedMCPToolOutput` as
-a substitute, and `htsave benchmark run --path shell` refuses paid runs until
-the contract lands. The MCP path gate above is unaffected by this block, and
-so is Claude Code, which already provides the contract.
+This condition remains **blocked by the current Codex hook contract**: it does
+not provide a successful arbitrary-result replacement response. The observer
+hook must not use `block`, `continue:false`, or unsupported
+`updatedMCPToolOutput` as a substitute, and `htsave benchmark run --path shell`
+refuses paid runs until the contract lands. The MCP path gate above is
+capability-based and unaffected by this block, as is Claude Code, which already
+provides the contract.
 
 ## Paired benchmark
 

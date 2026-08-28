@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import htsave.cli as cli_module
 from htsave.cas import ContentAddressedStore
 from htsave.cli import main
+from htsave.compat import CodexCompatibility
 from htsave.engine import ContextEngine
 from htsave.paths import build_state_paths
+from htsave.plugin import PluginState, PluginStatus
 from htsave.registry import Registry
 from htsave.tokens import TokenEstimator
 
@@ -60,6 +63,46 @@ def test_hydrate_writes_exact_bytes(tmp_path: Path, capsysbinary) -> None:  # ty
         == 0
     )
     assert capsysbinary.readouterr().out == content
+
+
+def test_codex_status_reports_integration_and_capabilities(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    integration = PluginStatus(
+        state=PluginState.INSTALLED_ENABLED,
+        expected_version="1.0.0",
+        installed_version="1.0.0",
+        enabled=True,
+        marketplace_registered=True,
+        marketplace_root=tmp_path,
+    )
+
+    class FakeManager:
+        def status(self) -> PluginStatus:
+            return integration
+
+    monkeypatch.setattr(cli_module, "_manager", lambda _args: FakeManager())
+    monkeypatch.setattr(
+        cli_module,
+        "probe_codex_compatibility",
+        lambda: CodexCompatibility(
+            "0.150.1",
+            True,
+            "capability-compatible",
+            mcp_tool_injection=True,
+        ),
+    )
+
+    assert main(["--json", "codex", "status"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["integration"]["state"] == "installed-enabled"
+    assert payload["codex_contract"] == {
+        "detected_version": "0.150.1",
+        "mcp_tool_injection": True,
+        "posttool_result_replacement": False,
+        "reason": "capability-compatible",
+        "supported": True,
+    }
 
 
 def test_gc_and_clear_are_dry_run_by_default(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]

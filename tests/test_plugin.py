@@ -5,6 +5,7 @@ import os
 import shlex
 import stat
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -161,8 +162,62 @@ class FakeCodex:
 def runtime_python(tmp_path: Path) -> Path:
     executable = tmp_path / "Python Runtime" / ("python.exe" if os.name == "nt" else "python")
     executable.parent.mkdir()
-    executable.touch()
-    return executable.resolve()
+    if os.name == "nt":
+        return Path(sys.executable)
+    executable.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+    executable.chmod(0o700)
+    return executable.absolute()
+
+
+def test_explicit_symlink_runtime_path_is_preserved(tmp_path) -> None:
+    executable = runtime_python(tmp_path)
+    linked = tmp_path / "linked-runtime"
+    try:
+        linked.symlink_to(executable)
+    except OSError:
+        pytest.skip("symbolic links are unavailable")
+
+    paths = build_plugin_paths(tmp_path / "state")
+    materialize_plugin(
+        paths=paths,
+        template_root=TEMPLATE_ROOT,
+        python_executable=linked,
+        package_version="1.2.3",
+    )
+
+    mcp = json.loads((paths.plugin_root / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp[PLUGIN_NAME]["command"] == str(linked)
+    hooks = json.loads((paths.plugin_root / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    expected_argv = [str(linked), "-m", HOOK_MODULE]
+    assert {
+        handler["command"]
+        for groups in hooks["hooks"].values()
+        for group in groups
+        for handler in group["hooks"]
+    } == {shlex.join(expected_argv)}
+
+    manager = CodexPluginManager(
+        state_root=tmp_path / "manager-state",
+        template_root=TEMPLATE_ROOT,
+        python_executable=linked,
+    )
+    assert manager.python_executable == linked
+
+
+def test_default_runtime_path_prefers_virtualenv_launcher(tmp_path, monkeypatch) -> None:
+    environment_root = tmp_path / "venv"
+    scripts = "Scripts" if os.name == "nt" else "bin"
+    launcher = "python.exe" if os.name == "nt" else "python"
+    candidate = environment_root / scripts / launcher
+    candidate.parent.mkdir(parents=True)
+    candidate.touch()
+    raw_interpreter = tmp_path / "uv-python"
+    raw_interpreter.touch()
+    monkeypatch.setattr(plugin_module.sys, "prefix", str(environment_root))
+    monkeypatch.setattr(plugin_module.sys, "base_prefix", str(tmp_path / "base"))
+    monkeypatch.setattr(plugin_module.sys, "executable", str(raw_interpreter))
+
+    assert plugin_module._runtime_python_path() == candidate
 
 
 def test_materialize_renders_direct_mcp_hooks_marketplace_and_ownership(tmp_path) -> None:
@@ -322,6 +377,33 @@ def test_status_reports_disabled_and_drift_states(tmp_path) -> None:
     assert status.state is PluginState.DRIFTED
     assert PluginDrift.PLUGIN_VERSION in status.drifts
     assert PluginDrift.MCP_COMMAND in status.drifts
+
+
+def test_status_reports_mcp_runtime_import_failure(tmp_path) -> None:
+    executable = tmp_path / "missing-python"
+    fake = FakeCodex(executable)
+    manager = CodexPluginManager(
+        state_root=tmp_path / "state",
+        template_root=TEMPLATE_ROOT,
+        python_executable=executable,
+        package_version="1.2.3",
+        runner=fake,
+    )
+    materialize_plugin(
+        paths=manager.paths,
+        template_root=TEMPLATE_ROOT,
+        python_executable=executable,
+        package_version="1.2.3",
+    )
+    fake.marketplace_root = manager.paths.marketplace_root
+    fake.installed = True
+    fake.enabled = True
+    fake.version = "1.2.3"
+
+    status = manager.status()
+
+    assert status.state is PluginState.DRIFTED
+    assert PluginDrift.MCP_RUNTIME in status.drifts
 
 
 def test_status_reports_marketplace_name_conflict(tmp_path) -> None:

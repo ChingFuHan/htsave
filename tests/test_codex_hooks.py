@@ -9,7 +9,6 @@ import pytest
 from htsave.capabilities import canonical_arguments_hash
 from htsave.cas import ContentAddressedStore
 from htsave.codex_hooks import (
-    SUPPORTED_CODEX_VERSION,
     PostToolUseEvent,
     decode_observed_text,
     dispatch_hook,
@@ -24,6 +23,8 @@ from htsave.paths import build_state_paths
 from htsave.registry import Registry
 from htsave.tokens import TokenEstimator
 from htsave.transport import parse_transport
+
+SUPPORTED_CODEX_VERSION = "0.148.0"  # historical event fixture, not a gate
 
 
 def _common(
@@ -175,7 +176,7 @@ def _seed_pending(tmp_path: Path, *, tool_use_id: str = "domain-tool-1") -> tupl
         return generation, decision.target_hash
 
 
-def test_v0148_parser_requires_documented_fields_and_accepts_additive_unknowns(
+def test_parser_requires_documented_fields_and_accepts_additive_unknowns(
     tmp_path: Path,
 ) -> None:
     payload = _post_tool(tmp_path)
@@ -195,8 +196,8 @@ def test_v0148_parser_requires_documented_fields_and_accepts_additive_unknowns(
     with pytest.raises(CompatibilityError, match="transcript_path"):
         parse_hook_event(wrong_type)
 
-    with pytest.raises(CompatibilityError, match="contract version"):
-        parse_hook_event(payload, contract_version="0.149.0")
+    versioned = parse_hook_event(payload, contract_version="0.150.1")
+    assert isinstance(versioned, PostToolUseEvent)
 
 
 def test_source_fingerprint_uses_tool_name_and_canonical_public_input(
@@ -408,54 +409,46 @@ def test_pretool_only_rewrites_the_two_exact_htsave_mcp_names(tmp_path: Path) ->
         )
 
 
-def test_unknown_codex_version_disables_contract_actions_but_not_session_generation(
+def test_newer_codex_version_keeps_contract_actions_enabled(
     tmp_path: Path,
 ) -> None:
-    assert (
-        dispatch_hook(
-            _session_start(tmp_path, "startup"),
-            state_root=_state_root(tmp_path),
-            codex_version="0.149.0",
-        )
-        == {}
+    dispatch_hook(
+        _session_start(tmp_path, "startup"),
+        state_root=_state_root(tmp_path),
+        codex_version="0.150.1",
     )
     generation, _ = _seed_pending(tmp_path)
 
-    assert (
-        dispatch_hook(
-            _pre_tool(tmp_path),
-            state_root=_state_root(tmp_path),
-            codex_version="0.149.0",
-        )
-        == {}
+    response = dispatch_hook(
+        _pre_tool(tmp_path),
+        state_root=_state_root(tmp_path),
+        codex_version="0.150.1",
     )
+    assert response["hookSpecificOutput"]["updatedInput"]["_htsave_context"]
+
     assert (
         dispatch_hook(
             _post_tool(tmp_path, tool_use_id="unknown-version-post"),
             state_root=_state_root(tmp_path),
-            codex_version="0.149.0",
+            codex_version="0.150.1",
         )
         == {}
     )
-    assert (
-        dispatch_hook(
-            _subagent_start(tmp_path, "agent-unknown"),
-            state_root=_state_root(tmp_path),
-            codex_version="0.149.0",
-        )
-        == {}
+    dispatch_hook(
+        _subagent_start(tmp_path, "agent-newer"),
+        state_root=_state_root(tmp_path),
+        codex_version="0.150.1",
     )
 
     with Registry(_paths(tmp_path).database, _paths(tmp_path).session_key) as registry:
-        assert len(registry.pending_receipts(generation)) == 1
+        assert registry.pending_receipts(generation) == ()
         assert (
-            int(registry.connection.execute("SELECT COUNT(*) FROM capabilities").fetchone()[0]) == 0
+            int(registry.connection.execute("SELECT COUNT(*) FROM capabilities").fetchone()[0]) == 1
         )
         assert (
             int(registry.connection.execute("SELECT COUNT(*) FROM active_agents").fetchone()[0])
-            == 0
+            == 1
         )
-        assert registry.stats().events == 1
 
 
 def test_injected_compatibility_probe_is_fail_open(tmp_path: Path) -> None:
@@ -464,7 +457,7 @@ def test_injected_compatibility_probe_is_fail_open(tmp_path: Path) -> None:
     def incompatible() -> CodexCompatibility:
         nonlocal calls
         calls += 1
-        return CodexCompatibility("0.149.0", False, "incompatible-codex-version")
+        return CodexCompatibility("0.150.1", False, "hook-contract-probe-failed")
 
     assert (
         dispatch_hook(
@@ -475,6 +468,26 @@ def test_injected_compatibility_probe_is_fail_open(tmp_path: Path) -> None:
         == {}
     )
     assert calls == 1
+    assert not _paths(tmp_path).database.exists()
+
+
+def test_missing_mcp_injection_capability_does_not_issue_a_token(tmp_path: Path) -> None:
+    def no_mcp_injection() -> CodexCompatibility:
+        return CodexCompatibility(
+            "0.150.1",
+            True,
+            "capability-incomplete",
+            mcp_tool_injection=False,
+        )
+
+    assert (
+        dispatch_hook(
+            _pre_tool(tmp_path),
+            state_root=_state_root(tmp_path),
+            compatibility_probe=no_mcp_injection,
+        )
+        == {}
+    )
     assert not _paths(tmp_path).database.exists()
 
 

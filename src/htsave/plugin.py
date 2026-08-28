@@ -25,6 +25,8 @@ PLUGIN_SELECTOR = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
 OWNERSHIP_FILE = ".htsave-owned.json"
 MCP_MODULE = "htsave.mcp_server"
 HOOK_MODULE = "htsave.codex_hooks"
+_MCP_RUNTIME_IMPORT = "import htsave.mcp_server"
+_MCP_RUNTIME_TIMEOUT_SECONDS = 5
 
 
 class PluginIntegrationError(HtsaveError):
@@ -67,6 +69,7 @@ class PluginDrift(StrEnum):
     MCP_SERVER_MISSING = "mcp-server-missing"
     MCP_COMMAND = "mcp-command-mismatch"
     MCP_ARGS = "mcp-args-mismatch"
+    MCP_RUNTIME = "mcp-runtime-unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +188,51 @@ def _command_lines(python_executable: Path) -> tuple[str, str]:
     return shlex.join(argv), subprocess.list2cmdline(argv)
 
 
+def _absolute_lexical_path(path: Path) -> Path:
+    """Make a path absolute without resolving symbolic links."""
+
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
+def _runtime_python_path(python_executable: Path | None = None) -> Path:
+    """Select the interpreter path that Codex should use to run htsave."""
+
+    if python_executable is not None:
+        return _absolute_lexical_path(python_executable)
+
+    scripts_directory = "Scripts" if os.name == "nt" else "bin"
+    launcher_name = "python.exe" if os.name == "nt" else "python"
+    environment_roots: list[Path] = []
+    if sys.prefix != sys.base_prefix:
+        environment_roots.append(Path(sys.prefix))
+    for variable in ("VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"):
+        value = os.environ.get(variable)
+        if value:
+            environment_roots.append(Path(value))
+
+    for root in environment_roots:
+        candidate = _absolute_lexical_path(root / scripts_directory / launcher_name)
+        if candidate.is_file():
+            return candidate
+    return _absolute_lexical_path(Path(sys.executable))
+
+
+def _mcp_runtime_importable(python_executable: Path) -> bool:
+    """Check that the configured interpreter can import the MCP server."""
+
+    try:
+        result = subprocess.run(
+            [str(python_executable), "-c", _MCP_RUNTIME_IMPORT],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_MCP_RUNTIME_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def render_hooks_document(document: Any, python_executable: Path) -> dict[str, Any]:
     """Bind every command handler in a hooks template to one Python interpreter."""
 
@@ -299,9 +347,7 @@ def materialize_plugin(
 
     target = paths or build_plugin_paths()
     template = (template_root or default_template_root()).expanduser().resolve()
-    executable = (python_executable or Path(sys.executable)).expanduser().resolve()
-    if not executable.is_absolute():  # pragma: no cover - resolve() makes this defensive
-        raise PluginIntegrationError("Python executable path must be absolute")
+    executable = _runtime_python_path(python_executable)
     if not package_version:
         raise PluginIntegrationError("plugin version must not be empty")
 
@@ -451,7 +497,7 @@ class CodexPluginManager:
     ) -> None:
         self.paths = build_plugin_paths(state_root)
         self.template_root = template_root
-        self.python_executable = (python_executable or Path(sys.executable)).expanduser().resolve()
+        self.python_executable = _runtime_python_path(python_executable)
         self.package_version = package_version
         self.client = CodexClient(runner, codex_executable)
 
@@ -601,12 +647,15 @@ class CodexPluginManager:
                 drifts.append(PluginDrift.MCP_SERVER_MISSING)
             else:
                 transport = mcp.get("transport")
-                if not isinstance(transport, dict) or not _same_path(
+                command_matches = isinstance(transport, dict) and _same_path(
                     transport.get("command"), self.python_executable
-                ):
+                )
+                if not command_matches:
                     drifts.append(PluginDrift.MCP_COMMAND)
                 if not isinstance(transport, dict) or transport.get("args") != ["-m", MCP_MODULE]:
                     drifts.append(PluginDrift.MCP_ARGS)
+                if command_matches and not _mcp_runtime_importable(self.python_executable):
+                    drifts.append(PluginDrift.MCP_RUNTIME)
 
         unique_drifts = tuple(dict.fromkeys(drifts))
         if conflict or PluginDrift.OWNERSHIP_MISMATCH in unique_drifts:

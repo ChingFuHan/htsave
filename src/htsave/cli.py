@@ -71,9 +71,20 @@ def _codex_install(args: argparse.Namespace) -> int:
 
 
 def _codex_status(args: argparse.Namespace) -> int:
-    status = _manager(args).status()
-    _emit(status, as_json=args.json)
-    return 0 if status.healthy else 1
+    integration = _manager(args).status()
+    compatibility = probe_codex_compatibility()
+    _emit(
+        {
+            "integration": integration,
+            "codex_contract": compatibility,
+        },
+        as_json=args.json,
+    )
+    return (
+        0
+        if integration.healthy and compatibility.supported and compatibility.mcp_tool_injection
+        else 1
+    )
 
 
 def _codex_uninstall(args: argparse.Namespace) -> int:
@@ -203,6 +214,8 @@ def _doctor(args: argparse.Namespace) -> int:
         "ok": compatibility.supported,
         "detected_version": compatibility.detected_version,
         "reason": compatibility.reason,
+        "mcp_tool_injection": compatibility.mcp_tool_injection,
+        "posttool_result_replacement": compatibility.posttool_result_replacement,
     }
     claude = probe_claude_compatibility()
     checks["claude_contract"] = {
@@ -234,11 +247,12 @@ def _doctor(args: argparse.Namespace) -> int:
         "ok": False,
         "status": "manual-review-required",
         "action": "open /hooks in Codex and trust the installed htsave hook hash",
-        "reason": "Codex 0.148.0 has no stable noninteractive hook-trust query",
+        "reason": "Codex has no stable noninteractive hook-trust query",
     }
     checks["mcp_read_path"] = {
-        "ok": compatibility.mcp_tool_injection,
+        "ok": compatibility.supported and compatibility.mcp_tool_injection,
         "status": "supported" if compatibility.mcp_tool_injection else compatibility.reason,
+        "detected_version": compatibility.detected_version,
         "reason": (
             "PreToolUse updatedInput injection drives htsave_read and htsave_hydrate; "
             "this is the delivery path that saves tokens today"
@@ -246,7 +260,7 @@ def _doctor(args: argparse.Namespace) -> int:
     }
     checks["codex_transparent_posttool_replacement"] = {
         "ok": False,
-        "status": "unsupported-by-codex-0.148.0",
+        "status": "unsupported-by-current-codex-contract",
         "reason": (
             "PostToolUse has no supported successful arbitrary-result replacement; "
             "observer mode preserves the original result"

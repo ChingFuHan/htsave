@@ -131,18 +131,22 @@ on its own, so htsave adds nothing in that specific case. It adds savings where
 the host does not de-duplicate: repeated command output, repeated MCP results,
 and re-reads of a file that changed slightly, which become verified deltas.
 
-## Codex 0.148.0 contract boundary
+## Codex hook contract boundary
 
-The official release contract exposes successful input replacement on
+The documented Codex hook contract exposes successful input replacement on
 `PreToolUse`, but no successful arbitrary output replacement on `PostToolUse`.
-`updatedMCPToolOutput` and `suppressOutput` are parsed and rejected;
-`decision: "block"` rejects nested code-mode promises, and `continue: false`
-changes result/control semantics. Therefore:
+The adapter follows Caveman's compatibility shape: a parseable CLI version
+only opts into trying the adapter; each event still validates its required
+fields, and a changed or unknown event shape fails open. Additive fields are
+ignored. Therefore:
 
 - the explicit `htsave_read` / `htsave_hydrate` MCP path can return FULL, REF,
   and DELTA;
 - `PostToolUse` can safely observe and ingest supported text while returning
   `{}` so the original result is unchanged;
+- `PreToolUse.updatedInput` remains the MCP capability boundary. If a host
+  ignores it, the MCP server rejects the missing capability rather than
+  falling back to an unauthorised read;
 - transparent token-saving replacement is release-gated off until Codex ships
   an official successful-result replacement contract.
 

@@ -119,11 +119,14 @@ stdout、`Read` 的檔案內容，以及單一文字的非錯誤 MCP 結果。�
 htsave 的價值在於重複的指令輸出、重複的 MCP 結果，以及重新讀取只有些微變更的
 檔案。
 
-在 **Codex CLI** 上，只有 MCP tools 能節省 token。Codex 0.148.0 的 PostToolUse
-沒有提供成功的任意結果替換回應，因此 PostToolUse adapter 僅為觀察者模式：它擷取
-明確的文字並回傳 `{}` 以保留原始結果。它不使用 `block`、`continue:false`、
+在 **Codex CLI** 上，只有 MCP tools 能節省 token。Adapter 將可解析的 Codex
+版本視為可以嘗試目前 hook 契約，並在每個事件驗證必要欄位，因此 Codex 增加版本時
+不需要重新安裝 htsave；新增欄位會被忽略，格式改變則 fail-open。
+`PreToolUse.updatedInput` 負責攜帶一次性 MCP capability。Codex 的
+`PostToolUse` 仍沒有支援成功的任意結果替換回應，因此該 adapter 僅為觀察者模式，
+回傳 `{}` 以保留原始結果。它不使用 `block`、`continue:false`、
 `updatedMCPToolOutput`、transcript 解析、hosted-tool 攔截或 wire/app-server
-proxy。這仍然是明確的 release gate，直到 Codex 發佈正式合約為止。
+proxy。透明替換仍是明確的 release gate，直到 Codex 發佈正式合約為止。
 
 所有狀態都儲存在平台 user-data 目錄下（可用 `HTSAVE_STATE_DIR` 覆寫），以
 SHA-256 session key 分隔。每個 session 有一個不可變的 CAS 和 SQLite WAL
