@@ -160,4 +160,5 @@ Official contracts:
 
 No semantic deduplication, embeddings, RAG, LLM summaries, distributed cache,
 telemetry, automatic GC, Web UI, transcript parsing, hosted-tool interception,
-app-server/wire proxy, or adapters for non-Codex agents.
+app-server/wire proxy, or adapters for agent CLIs beyond Claude Code, Codex CLI,
+and Antigravity agy.

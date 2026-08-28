@@ -32,7 +32,7 @@ labelled a completed v1 release until every gate below is green.
   directories, special files, invalid UTF-8, invalid ranges, and cross-session
   hydrate attempts.
 
-htsave has two delivery paths and two hosts. The paths are gated separately,
+htsave has two delivery paths and three hosts. The paths are gated separately,
 because Codex CLI supports one of them today and not the other; Claude Code
 supports both. `htsave doctor` reports every combination.
 

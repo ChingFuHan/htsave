@@ -9,10 +9,12 @@
 # htsave
 
 `htsave` 1.0.0 is a local, deterministic, lossless repeated-context layer for
-Claude Code and Codex CLI. It stores exact UTF-8 tool results once per session
-and can return a confirmed reference or a verified `unified-diff-v1` delta. It
-never normalizes bytes, summarizes content, performs semantic/embedding search,
-or sends telemetry.
+Claude Code, Codex CLI, and Antigravity agy. It stores exact UTF-8 tool results
+once per session and can return a confirmed reference or a verified
+`unified-diff-v1` delta. It never normalizes bytes, summarizes content, performs
+semantic/embedding search, or sends telemetry. agy is supported as an explicit
+MCP integration, but its current live savings gate is red and carries no savings
+claim.
 
 The package is versioned 1.0.0. The remaining v1 release evidence is tracked in
 [docs/release-gates.md](docs/release-gates.md); this repository should not be
@@ -21,7 +23,57 @@ treated as a completed v1 release until those gates are green.
 On Claude Code it saves tokens transparently: repeat a command and its output
 comes back as a reference instead of the full text, with nothing to change in
 how you work. On Codex CLI only the explicit MCP tools save tokens, because
-Codex has no supported way to replace a tool result.
+Codex has no supported way to replace a tool result. On agy, the same explicit
+MCP tools are available alongside fail-open lifecycle hooks.
+
+## At a glance
+
+`htsave` intercepts repeated context at the host boundary. The first result is
+stored as exact bytes; later results become a compact `REF` or a verified
+`DELTA`, while `htsave_hydrate` can restore the original bytes exactly.
+
+```mermaid
+flowchart LR
+    C[Claude Code] --> CH[Claude hooks<br/>transparent replacement]
+    X[Codex CLI] --> XM[Explicit MCP<br/>htsave_read / hydrate]
+    A[Antigravity agy] --> AM[Explicit MCP<br/>lifecycle hooks]
+    CH --> E[ContextEngine<br/>FULL / REF / DELTA / BYPASS]
+    XM --> E
+    AM --> E
+    E --> S[(CAS<br/>exact bytes)]
+    E --> R[(SQLite WAL<br/>receipts + generations)]
+    E --> O[Model-facing result]
+```
+
+### Supported host matrix
+
+| Host | Install | Model-facing path | Transparent replacement | Current evidence |
+| :--- | :--- | :--- | :---: | :--- |
+| **Claude Code** | `htsave claude install` | Shell hooks | ✅ Yes | 80/80; savings gate passed |
+| **Codex CLI** | `htsave codex install` | Explicit MCP: `htsave_read` / `htsave_hydrate` | ❌ No | 80/80; savings gate passed |
+| **Antigravity agy** | `htsave agy install` | Explicit MCP + lifecycle hooks | ❌ No | 80/80; integration installed, savings gate red |
+
+### Live models covered
+
+This table lists models used in real benchmark executions, not merely names in
+defaults or test fixtures.
+
+| Model | Host / path | Executions | Observed result |
+| :--- | :--- | ---: | :--- |
+| `gpt-5.6-luna` (low) | Codex CLI / explicit MCP | 80/80 | ✅ Passed; 30.43%–41.69% median reduction |
+| `claude-haiku-4-5-20251001` | Claude Code / transparent shell | 80/80 | ✅ Passed; 92.40%–94.91% median reduction |
+| `gemini-3.7-flash-low` | agy / MCP v2; v3 zero-hydrate | 80/80 per run | ⚠️ Red; v2 −18.69%–26.07%, v3 −4.32%–22.80% |
+| `gemini-3.1-pro-low` | agy / MCP v1; v3 zero-hydrate | 80/80 per run | ⚠️ Red overall; v1 3.31%–48.44%, v3 7.02%–43.78% |
+| `claude-sonnet-4-6` | agy / explicit MCP | 28/80 | ⏸ Partial, quota-limited; 2.27% on 10 completed pairs |
+
+`gpt-5.6-luna` and the agy models are local model selections for these runs;
+token counts do not imply official prices or discounts. Detailed scenario
+tables, manifest paths, and audit notes are in [verify.md](verify.md).
+
+The code also names `gpt-5.6-sol` (Codex benchmark default), `claude-opus-5`
+(Claude default/test fixture), and `gpt-5` (CLI estimator/hydrate default).
+`claude-3-5-haiku` is an unavailable historical alias. These are not live
+benchmark evidence and are intentionally excluded from the table above.
 
 ## Install
 

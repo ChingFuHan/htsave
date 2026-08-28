@@ -11,10 +11,11 @@
 
 # htsave
 
-`htsave` 1.0.0 是一個本地、確定性、無損的重複內容快取層，適用於 Claude Code
-和 Codex CLI。它將精確的 UTF-8 tool 輸出結果在每個 session 中只儲存一次，後續
-可回傳已確認的參考指標或經驗證的 `unified-diff-v1` 差異。它絕不會正規化位元組、
-摘要內容、執行語意/嵌入搜尋，也不會傳送遙測資料。
+`htsave` 1.0.0 是一個本地、確定性、無損的重複內容快取層，適用於 Claude Code、
+Codex CLI 和 Antigravity agy。它將精確的 UTF-8 tool 輸出結果在每個 session 中只
+儲存一次，後續可回傳已確認的參考指標或經驗證的 `unified-diff-v1` 差異。它絕不會
+正規化位元組、摘要內容、執行語意/嵌入搜尋，也不會傳送遙測資料。agy 支援顯式 MCP
+整合，但目前的實機節省 gate 為紅燈，不作任何節省聲明。
 
 本套件版本為 1.0.0。剩餘的 v1 發佈驗收項目追蹤於
 [docs/release-gates.md](docs/release-gates.md)；在所有驗收項目通過之前，本專案
@@ -22,7 +23,55 @@
 
 在 Claude Code 上，它能透明地節省 token：重複執行一個指令，其輸出會以參考指標
 而非完整文字回傳，你的工作流程完全不需要改變。在 Codex CLI 上，只有明確使用 MCP
-tools 才能節省 token，因為 Codex 目前沒有支援替換 tool 結果的方式。
+tools 才能節省 token，因為 Codex 目前沒有支援替換 tool 結果的方式。在 agy 上，同樣
+提供顯式 MCP tools，並搭配 fail-open 生命週期 hook。
+
+## 一眼看懂
+
+`htsave` 在 host 邊界攔截重複內容。第一次結果以精確位元組儲存；後續結果會變成
+精簡的 `REF` 或經驗證的 `DELTA`，需要時 `htsave_hydrate` 可逐字節還原原始內容。
+
+```mermaid
+flowchart LR
+    C[Claude Code] --> CH[Claude hooks<br/>透明替換]
+    X[Codex CLI] --> XM[顯式 MCP<br/>htsave_read / hydrate]
+    A[Antigravity agy] --> AM[顯式 MCP<br/>生命週期 hooks]
+    CH --> E[ContextEngine<br/>FULL / REF / DELTA / BYPASS]
+    XM --> E
+    AM --> E
+    E --> S[(CAS<br/>精確位元組)]
+    E --> R[(SQLite WAL<br/>receipts + generations)]
+    E --> O[提供給 model 的結果]
+```
+
+### 支援平台矩陣
+
+| 平台 | 安裝指令 | 提供給 model 的路徑 | 透明替換 | 目前證據 |
+| :--- | :--- | :--- | :---: | :--- |
+| **Claude Code** | `htsave claude install` | Shell hooks | ✅ 有 | 80/80；節省 gate 通過 |
+| **Codex CLI** | `htsave codex install` | 顯式 MCP：`htsave_read` / `htsave_hydrate` | ❌ 無 | 80/80；節省 gate 通過 |
+| **Antigravity agy** | `htsave agy install` | 顯式 MCP + 生命週期 hooks | ❌ 無 | 80/80；整合已安裝，節省 gate 紅燈 |
+
+### 實際測試過的模型
+
+下表只列出實際執行過 benchmark 的模型，不包含僅出現在預設值或測試 fixture
+中的名稱。
+
+| 模型 | Host / 路徑 | 執行數 | 實測結果 |
+| :--- | :--- | ---: | :--- |
+| `gpt-5.6-luna` (low) | Codex CLI / 顯式 MCP | 80/80 | ✅ 通過；節省中位數 30.43%–41.69% |
+| `claude-haiku-4-5-20251001` | Claude Code / 透明 shell | 80/80 | ✅ 通過；節省中位數 92.40%–94.91% |
+| `gemini-3.7-flash-low` | agy / MCP v2；v3 零 hydrate | 每次 80/80 | ⚠️ 紅燈；v2 −18.69%–26.07%，v3 −4.32%–22.80% |
+| `gemini-3.1-pro-low` | agy / MCP v1；v3 零 hydrate | 每次 80/80 | ⚠️ 整體紅燈；v1 3.31%–48.44%，v3 7.02%–43.78% |
+| `claude-sonnet-4-6` | agy / 顯式 MCP | 28/80 | ⏸ 部分完成、受 quota 限制；10 組完成 pair 為 2.27% |
+
+`gpt-5.6-luna` 與 agy 模型是本次測試選用的本地 model；token 數不代表官方價格或
+折扣。完整情境表、manifest 路徑與稽核說明請見 [verify.md](verify.md)。
+
+程式中另外出現 `gpt-5.6-sol`（Codex benchmark 預設）、`claude-opus-5`
+（Claude 預設／測試 fixture）及 `gpt-5`（CLI estimator／hydrate 預設）。
+`claude-3-5-haiku` 是不可用的歷史 alias。這些不是實機 benchmark 證據，因此刻意
+不列入上方表格。
 
 ## 安裝
 
