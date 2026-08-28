@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .agy_hooks import SESSION_START_ARG
 from .errors import HtsaveError
 from .plugin import MCP_MODULE, PLUGIN_NAME
 
@@ -163,6 +164,9 @@ def _install_mcp(home: Path | None = None) -> None:
     servers[PLUGIN_NAME] = {
         "command": str(interpreter),
         "args": ["-m", MCP_MODULE],
+        # agy spills large tool results to local brain files; padding
+        # compressed deliveries keeps the provider's prefix cache engaged.
+        "env": {"HTSAVE_DELIVERY_PAD_BYTES": "16384"},
         OWNER_KEY: _ownership_tag(),
     }
     _write_json(path, config)
@@ -196,8 +200,14 @@ def _install_hooks(home: Path | None = None) -> None:
     config = _read_json(path) if path.is_file() else {}
 
     command = _hook_command()
+    session_start_command = f"{command} {SESSION_START_ARG}"
     config["htsave"] = {
         OWNER_KEY: _ownership_tag(),
+        # SessionStart is real but undocumented; its payload carries no
+        # distinguishing fields, so the entry passes an explicit event argv.
+        "SessionStart": [
+            {"type": "command", "command": session_start_command, "timeout": 30}
+        ],
         "PreToolUse": [
             {
                 "matcher": "*",

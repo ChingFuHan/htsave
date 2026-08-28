@@ -1,14 +1,18 @@
 """Lifecycle hook adapter for Antigravity CLI (agy).
 
-agy hook contract (from ~/.gemini/config/hooks.json):
+agy hook contract (from ~/.gemini/config/hooks.json), verified against the
+1.1.20 binary's embedded docs and ``hooks_pb`` proto:
+
+- SessionStart:   undocumented but real; payload carries only common fields,
+                  so the installer passes an explicit ``session-start`` argv.
 - PreToolUse:     receives toolCall, can return {decision, overwrite}
 - PostToolUse:    receives stepIdx + error, must return {}
-- PreInvocation:  receives invocationNum, can return {injectSteps}
+- PreInvocation:  receives invocationNum, can return {injectSteps};
+                  ephemeral messages bill on their own turn and do not persist
 - Stop:           receives terminationReason, can return {decision: "continue"}
 
 Key differences from Claude Code / Codex:
-- No SessionStart -> lazy init on first PreToolUse
-- No PreCompact -> generation stays open (no compact recovery)
+- No compact recovery (no PreCompact equivalent)
 - No SubagentStart/Stop -> no subagent bypass mode
 - PostToolUse -> observer only, no output replacement
 
@@ -30,6 +34,7 @@ from .registry import Registry
 
 _HTSAVE_READ = "mcp__htsave__htsave_read"
 _HTSAVE_HYDRATE = "mcp__htsave__htsave_hydrate"
+SESSION_START_ARG = "session-start"
 PRE_INVOCATION_REMINDER = (
     "htsave: an HTSAVE/1 REF frame certifies byte-exact identity with content "
     "already delivered in this conversation. Never call htsave_hydrate to "
@@ -170,6 +175,32 @@ def _handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     return {"injectSteps": [{"ephemeralMessage": PRE_INVOCATION_REMINDER}]}
 
 
+def _handle_session_start(payload: dict[str, Any]) -> dict[str, Any]:
+    """Begin a real generation when agy signals session start.
+
+    Older agy builds never fire SessionStart, so lazy init on first
+    PreToolUse remains the fallback; when the event does fire it gives the
+    session the same explicit generation lifecycle as the Codex and Claude
+    Code adapters.  The payload carries only common fields, which is why the
+    installer passes an explicit ``session-start`` argv instead of relying on
+    shape inference.
+    """
+
+    session_id = _first_string(payload, "conversationId", "conversation_id", "sessionId")
+    if session_id is None:
+        return {}
+    state_root_value = os.environ.get("HTSAVE_STATE_DIR")
+    state_root = Path(state_root_value) if state_root_value else None
+    try:
+        paths = build_state_paths(session_id, state_root)
+        with Registry(paths.database, paths.session_key) as registry:
+            registry.begin_generation("startup")
+    except Exception:
+        # Fail open: lifecycle bookkeeping must never block agy startup.
+        return {}
+    return {}
+
+
 def _handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
     """Confirm pending receipts at session end; the response stays empty."""
 
@@ -188,12 +219,15 @@ def _handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     try:
+        arguments = list(sys.argv[1:] if argv is None else argv)
         payload = _read_stdin()
-        event = _detect_event(payload)
+        event = arguments[0] if arguments else _detect_event(payload)
 
-        if event == "PreToolUse":
+        if event == SESSION_START_ARG:
+            result = _handle_session_start(payload)
+        elif event == "PreToolUse":
             result = _handle_pre_tool_use(payload)
         elif event == "PostToolUse":
             result = _handle_post_tool_use(payload)

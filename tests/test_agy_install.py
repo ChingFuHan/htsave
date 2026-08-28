@@ -44,6 +44,11 @@ def test_install_creates_skill_mcp_and_hooks(tmp_path: Path) -> None:
     )
     assert "htsave" in hooks
     assert hooks["htsave"]["htsaveOwned"]["owner"] == "htsave"
+    # SessionStart is real but undocumented; its entry passes an explicit
+    # event argv because the payload carries no distinguishing fields.
+    session_start = hooks["htsave"]["SessionStart"]
+    assert isinstance(session_start, list) and session_start
+    assert session_start[0]["command"].endswith("session-start")
     # PreInvocation is a flat handler list in the agy contract.
     pre_invocation = hooks["htsave"]["PreInvocation"]
     assert isinstance(pre_invocation, list) and pre_invocation

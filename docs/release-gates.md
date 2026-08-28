@@ -118,11 +118,20 @@ PreToolUse `updatedInput` capability injection.
 
 ### Antigravity agy post-v2 forensics and hardening
 
+The complete reverse-engineered agy hook/tool contract, including the
+undocumented `SessionStart` event, injected-step billing semantics, and the
+proto-level proof that `PostToolHookResult` has no fields, is documented in
+[agy-contract.md](agy-contract.md).
+
 **Engineering hardening shipped after v2:**
 
 - `agy_hooks._handle_stop` now confirms pending receipts at session end;
   previously it returned `{}` while its docstring claimed confirmation, so a
   session's last REF/DELTA receipt stayed pending forever.
+- `SessionStart` support: the event fires on agy 1.1.20 even though it is
+  undocumented, so htsave now begins a real generation at session start
+  (lazy init remains the fallback for older builds) instead of on the first
+  tool call.
 - The benchmark-only `workspace-*` glob fallback was removed from
   `_workspace_path`. Workspace resolution is now payload-first
   (`workspacePaths`), then `HTSAVE_BENCH_WORKSPACE`, then `cwd`.

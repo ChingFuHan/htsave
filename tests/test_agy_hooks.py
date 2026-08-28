@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import json
 from pathlib import Path
 
 import htsave.agy_hooks as agy_hooks
@@ -112,6 +114,50 @@ def test_stop_confirms_pending_receipts(tmp_path: Path, monkeypatch) -> None:
 
 def test_stop_without_session_identity_is_a_noop() -> None:
     assert agy_hooks._handle_stop({}) == {}
+
+
+def test_session_start_begins_and_rotates_generations(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state = tmp_path / "state"
+    monkeypatch.setenv("HTSAVE_STATE_DIR", str(state))
+    session_id = "conversation-ss"
+    paths = build_state_paths(session_id, state)
+
+    assert agy_hooks._handle_session_start({"conversationId": session_id}) == {}
+    with Registry(paths.database, paths.session_key) as registry:
+        first = registry.active_generation()
+        assert first is not None
+
+    assert agy_hooks._handle_session_start({"conversationId": session_id}) == {}
+    with Registry(paths.database, paths.session_key) as registry:
+        second = registry.active_generation()
+        assert second is not None and second > first
+
+
+def test_session_start_without_identity_or_with_bad_state_fails_open(
+    tmp_path: Path, monkeypatch
+) -> None:
+    assert agy_hooks._handle_session_start({}) == {}
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("HTSAVE_STATE_DIR", str(blocker))
+    assert agy_hooks._handle_session_start({"conversationId": "conversation-y"}) == {}
+
+
+def test_main_routes_explicit_session_start_argv(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    state = tmp_path / "state"
+    monkeypatch.setenv("HTSAVE_STATE_DIR", str(state))
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"conversationId": "ss-1"})))
+
+    agy_hooks.main([agy_hooks.SESSION_START_ARG])
+
+    assert json.loads(capsys.readouterr().out) == {}
+    paths = build_state_paths("ss-1", state)
+    with Registry(paths.database, paths.session_key) as registry:
+        assert registry.active_generation() is not None
 
 
 def test_stop_fails_open_on_unusable_state_root(tmp_path: Path, monkeypatch) -> None:

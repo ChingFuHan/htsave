@@ -26,6 +26,45 @@ READ_TOOL = "htsave_read"
 HYDRATE_TOOL = "htsave_hydrate"
 HOOK_READ_TOOL = "mcp__htsave__htsave_read"
 HOOK_HYDRATE_TOOL = "mcp__htsave__htsave_hydrate"
+DELIVERY_PAD_ENV = "HTSAVE_DELIVERY_PAD_BYTES"
+
+
+def _delivery_pad(payload: str) -> str:
+    """Append a deterministic carrier for hosts that spill large tool results.
+
+    agy truncates tool results beyond a small internal threshold into a local
+    brain file and shows the model only a bounded preview. Empirically a tiny
+    inline REF or DELTA frame prevents the provider's implicit prefix cache
+    from engaging on later turns, which costs far more uncached input than the
+    compressed frame saves; a multi-line carrier pushes the delivery over the
+    threshold so repeated deliveries present the same stable, repeating
+    preview shape as any other large tool result. The carrier is written to
+    the local brain file and never reaches the API context in full; stored
+    objects and hydration are unaffected because only the delivered payload
+    gains the trailing lines. Disabled unless the environment sets a positive
+    byte target.
+    """
+
+    raw = os.environ.get(DELIVERY_PAD_ENV)
+    if not raw:
+        return payload
+    try:
+        target = int(raw)
+    except ValueError:
+        return payload
+    if target <= 0:
+        return payload
+    used = len(payload.encode("utf-8"))
+    if used >= target:
+        return payload
+    lines: list[str] = []
+    index = 0
+    while used < target:
+        line = f"PADLINE {index:04d} yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+        lines.append(line)
+        used += len(line) + 1
+        index += 1
+    return payload + "\n" + "\n".join(lines) + "\n"
 
 _CONTEXT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -96,6 +135,8 @@ def read_workspace_text(
                 )
             except (HtsaveError, OSError, sqlite3.Error):
                 return result.text
+            if decision.mode is DeliveryMode.REF or decision.mode is DeliveryMode.DELTA:
+                return _delivery_pad(decision.payload)
             return decision.payload
     except (HtsaveError, OSError, sqlite3.Error):
         if trusted_context:
