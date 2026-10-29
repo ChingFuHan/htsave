@@ -1,4 +1,4 @@
-"""Operator CLI for htsave local state and Codex integration."""
+"""Operator CLI for htsave local state and host integrations."""
 
 from __future__ import annotations
 
@@ -16,7 +16,11 @@ from typing import Any
 
 from .benchmark import BENCHMARK_HOSTS, BENCHMARK_PATHS, DEFAULT_HOST
 from .cas import ContentAddressedStore
-from .compat import probe_claude_compatibility, probe_codex_compatibility
+from .compat import (
+    probe_claude_compatibility,
+    probe_codex_compatibility,
+    probe_opencode_compatibility,
+)
 from .engine import ContextEngine
 from .errors import HtsaveError, SecurityBoundaryError
 from .operator import (
@@ -60,12 +64,24 @@ def _emit(value: Any, *, as_json: bool) -> None:
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def _warm_token_estimator() -> None:
+    """Load tiktoken's encoding at install time, so hooks never need the network later."""
+
+    if not TokenEstimator().available:
+        print(
+            "htsave: warning: tiktoken encoding is unavailable; repeated context passes "
+            "through unchanged until it can be downloaded (see TIKTOKEN_CACHE_DIR)",
+            file=sys.stderr,
+        )
+
+
 def _manager(args: argparse.Namespace) -> CodexPluginManager:
     return CodexPluginManager(state_root=configured_state_root(args.state_root))
 
 
 def _codex_install(args: argparse.Namespace) -> int:
     status = _manager(args).install()
+    _warm_token_estimator()
     _emit(status, as_json=args.json)
     return 0
 
@@ -115,17 +131,12 @@ def _claude_settings(args: argparse.Namespace) -> Path | None:
     return settings.expanduser() if settings is not None else None
 
 
-def _claude_skill(args: argparse.Namespace) -> Path | None:
-    skill = getattr(args, "skill_path", None)
-    return skill.expanduser() if skill is not None else None
-
-
 def _claude_install(args: argparse.Namespace) -> int:
     from .claude_install import install
 
-    status = install(
-        settings_path=_claude_settings(args), skill_path=_claude_skill(args)
-    )
+    source = {"marketplace": args.marketplace} if args.marketplace else {}
+    status = install(settings_path=_claude_settings(args), **source)
+    _warm_token_estimator()
     _emit(status, as_json=args.json)
     return 0
 
@@ -133,9 +144,7 @@ def _claude_install(args: argparse.Namespace) -> int:
 def _claude_status(args: argparse.Namespace) -> int:
     from .claude_install import status as claude_status
 
-    result = claude_status(
-        settings_path=_claude_settings(args), skill_path=_claude_skill(args)
-    )
+    result = claude_status(settings_path=_claude_settings(args))
     _emit(result, as_json=args.json)
     return 0 if result.healthy else 1
 
@@ -143,11 +152,7 @@ def _claude_status(args: argparse.Namespace) -> int:
 def _claude_uninstall(args: argparse.Namespace) -> int:
     from .claude_install import uninstall
 
-    payload = uninstall(
-        settings_path=_claude_settings(args),
-        skill_path=_claude_skill(args),
-        confirm=args.yes,
-    )
+    payload = uninstall(settings_path=_claude_settings(args), confirm=args.yes)
     _emit(payload, as_json=args.json)
     return 0
 
@@ -161,6 +166,7 @@ def _agy_install(args: argparse.Namespace) -> int:
     from .agy_install import install
 
     status = install(home=_agy_home(args))
+    _warm_token_estimator()
     _emit(status, as_json=args.json)
     return 0
 
@@ -181,6 +187,36 @@ def _agy_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
+def _opencode_project_dir(args: argparse.Namespace) -> Path | None:
+    project_dir = getattr(args, "project_dir", None)
+    return project_dir.expanduser() if project_dir is not None else None
+
+
+def _opencode_install(args: argparse.Namespace) -> int:
+    from .opencode_install import install
+
+    status = install(project_dir=_opencode_project_dir(args))
+    _warm_token_estimator()
+    _emit(status, as_json=args.json)
+    return 0
+
+
+def _opencode_status(args: argparse.Namespace) -> int:
+    from .opencode_install import status as opencode_status
+
+    result = opencode_status(project_dir=_opencode_project_dir(args))
+    _emit(result, as_json=args.json)
+    return 0 if result.healthy else 1
+
+
+def _opencode_uninstall(args: argparse.Namespace) -> int:
+    from .opencode_install import uninstall
+
+    payload = uninstall(project_dir=_opencode_project_dir(args), confirm=args.yes)
+    _emit(payload, as_json=args.json)
+    return 0
+
+
 def _doctor(args: argparse.Namespace) -> int:
     root = configured_state_root(args.state_root)
     checks: dict[str, dict[str, Any]] = {}
@@ -192,7 +228,7 @@ def _doctor(args: argparse.Namespace) -> int:
     checks["tiktoken_estimator"] = {
         "ok": estimator.available,
         "backend": estimator.backend,
-        "label": "estimate-only; not billed Codex usage",
+        "label": "estimate-only; not billed usage",
     }
     try:
         ensure_private_directory(root)
@@ -226,17 +262,31 @@ def _doctor(args: argparse.Namespace) -> int:
     }
     from .claude_install import status as claude_integration_status
 
-    integration = claude_integration_status()
-    checks["claude_integration"] = {
-        "ok": integration.healthy,
-        "status": integration,
-    }
+    try:
+        integration = claude_integration_status()
+        checks["claude_integration"] = {"ok": integration.healthy, "status": integration}
+    except HtsaveError as exc:
+        checks["claude_integration"] = {"ok": False, "error": str(exc)}
     from .agy_install import status as agy_integration_status
 
     agy_status_info = agy_integration_status()
     checks["agy_integration"] = {
         "ok": agy_status_info.healthy,
         "status": agy_status_info,
+    }
+    opencode = probe_opencode_compatibility()
+    checks["opencode_contract"] = {
+        "ok": opencode.supported,
+        "detected_version": opencode.detected_version,
+        "reason": opencode.reason,
+        "posttool_result_replacement": opencode.posttool_result_replacement,
+    }
+    from .opencode_install import status as opencode_integration_status
+
+    opencode_status_info = opencode_integration_status()
+    checks["opencode_integration"] = {
+        "ok": opencode_status_info.healthy,
+        "status": opencode_status_info,
     }
     plugin_status = _manager(args).status()
     checks["plugin"] = {
@@ -483,15 +533,17 @@ def build_parser() -> argparse.ArgumentParser:
     claude_commands = claude.add_subparsers(dest="claude_command", required=True)
     claude_install = claude_commands.add_parser("install")
     claude_install.add_argument("--settings", type=Path, help="override settings.json path")
-    claude_install.add_argument("--skill-path", type=Path, help="override skill file path")
+    claude_install.add_argument(
+        "--marketplace",
+        help="plugin marketplace: a GitHub owner/repo, URL, or local path "
+        "(default: ChingFuHan/htsave)",
+    )
     claude_install.set_defaults(handler=_claude_install)
     claude_status = claude_commands.add_parser("status")
     claude_status.add_argument("--settings", type=Path, help="override settings.json path")
-    claude_status.add_argument("--skill-path", type=Path, help="override skill file path")
     claude_status.set_defaults(handler=_claude_status)
     claude_uninstall = claude_commands.add_parser("uninstall")
     claude_uninstall.add_argument("--settings", type=Path, help="override settings.json path")
-    claude_uninstall.add_argument("--skill-path", type=Path, help="override skill file path")
     claude_uninstall.add_argument("--yes", action="store_true", help="confirm integration removal")
     claude_uninstall.set_defaults(handler=_claude_uninstall)
 
@@ -507,6 +559,21 @@ def build_parser() -> argparse.ArgumentParser:
     agy_uninstall_cmd.add_argument("--home", type=Path, help="override config home directory")
     agy_uninstall_cmd.add_argument("--yes", action="store_true", help="confirm removal")
     agy_uninstall_cmd.set_defaults(handler=_agy_uninstall)
+
+    opencode = commands.add_parser("opencode", help="manage the OpenCode CLI integration")
+    opencode_commands = opencode.add_subparsers(dest="opencode_command", required=True)
+    opencode_install_cmd = opencode_commands.add_parser("install")
+    opencode_install_cmd.add_argument("--project-dir", type=Path, help="override project directory")
+    opencode_install_cmd.set_defaults(handler=_opencode_install)
+    opencode_status_cmd = opencode_commands.add_parser("status")
+    opencode_status_cmd.add_argument("--project-dir", type=Path, help="override project directory")
+    opencode_status_cmd.set_defaults(handler=_opencode_status)
+    opencode_uninstall_cmd = opencode_commands.add_parser("uninstall")
+    opencode_uninstall_cmd.add_argument(
+        "--project-dir", type=Path, help="override project directory"
+    )
+    opencode_uninstall_cmd.add_argument("--yes", action="store_true", help="confirm removal")
+    opencode_uninstall_cmd.set_defaults(handler=_opencode_uninstall)
 
     doctor = commands.add_parser("doctor")
     doctor.set_defaults(handler=_doctor)
@@ -538,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     clear.add_argument("--yes", action="store_true", help="confirm irreversible deletion")
     clear.set_defaults(handler=_clear)
 
-    benchmark = commands.add_parser("benchmark", help="run or inspect the paired Codex benchmark")
+    benchmark = commands.add_parser("benchmark", help="run or inspect a paired host benchmark")
     benchmark_commands = benchmark.add_subparsers(dest="benchmark_command", required=True)
     benchmark_run = benchmark_commands.add_parser("run")
     benchmark_run.add_argument("--output", type=Path, required=True)

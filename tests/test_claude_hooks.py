@@ -253,11 +253,54 @@ def test_ambiguous_or_unsupported_results_pass_through_untouched(tmp_path: Path)
         )
 
 
-def test_htsave_own_mcp_results_are_never_re_ingested(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "tool_name", ["mcp__htsave__htsave_read", "mcp__plugin_htsave_htsave__htsave_read"]
+)
+def test_htsave_own_mcp_results_are_never_re_ingested(tmp_path: Path, tool_name: str) -> None:
     payload = _post_read(_large_text(), "toolu_self")
-    payload["tool_name"] = "mcp__htsave__htsave_read"
+    payload["tool_name"] = tool_name
 
     assert decode_observed_response(parse_hook_event(payload)) is None
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["mcp__htsave__htsave_read", "mcp__plugin_htsave_htsave__htsave_read"]
+)
+def test_settings_and_plugin_mcp_names_both_get_a_consumable_capability(
+    tmp_path: Path, tool_name: str
+) -> None:
+    from htsave.mcp_server import read_workspace_text
+
+    state_root = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "sample.txt").write_text("exact\r\n雪\n", encoding="utf-8", newline="")
+    dispatch_hook(_session_start(), state_root=state_root, compatibility=SUPPORTED)
+    response = dispatch_hook(
+        {
+            "session_id": SESSION,
+            "transcript_path": None,
+            "cwd": str(workspace),
+            "prompt_id": "92e5327b-0982-4192-a37f-1acaebe0aa6c",
+            "permission_mode": "default",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool_name,
+            "tool_use_id": "toolu_cap",
+            "tool_input": {"path": "sample.txt"},
+        },
+        state_root=state_root,
+        compatibility=SUPPORTED,
+    )
+
+    updated = response["hookSpecificOutput"]["updatedInput"]
+    text = read_workspace_text(
+        path=updated["path"], _htsave_context=updated["_htsave_context"], state_root=state_root
+    )
+    assert text == "exact\r\n雪\n"
+    paths = build_state_paths(SESSION, state_root)
+    with closing(sqlite3.connect(paths.database)) as connection:
+        consumed = connection.execute("SELECT tool_name FROM capabilities").fetchall()
+    assert consumed == [("mcp__htsave__htsave_read",)]
 
 
 def test_incompatible_claude_never_transforms_but_still_tracks_generations(

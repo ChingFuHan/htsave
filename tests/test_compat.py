@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from htsave.compat import probe_codex_compatibility
+from htsave.compat import probe_codex_compatibility, probe_opencode_compatibility
 
 
 @dataclass
@@ -34,3 +34,34 @@ def test_unparseable_or_failed_version_probe_fails_open() -> None:
         assert not compatibility.supported
         assert not compatibility.mcp_tool_injection
         assert not compatibility.posttool_result_replacement
+
+
+def test_parseable_opencode_versions_are_capability_compatible() -> None:
+    for version in ("1.18.4", "v2.0.0", "1.0.0-beta.1"):
+        compatibility = probe_opencode_compatibility(
+            runner=lambda _, version=version: Result(0, f"{version}\n")
+        )
+        assert compatibility.supported
+        assert compatibility.detected_version is not None
+        assert compatibility.reason == "capability-compatible"
+        assert compatibility.posttool_result_replacement
+        assert compatibility.mcp_tool_injection
+
+
+def test_unparseable_or_failed_opencode_version_probe_fails_open() -> None:
+    for result in (
+        Result(0, "not-a-version\n"),
+        Result(1, "1.18.4\n"),
+        Result(0, None),
+    ):
+        compatibility = probe_opencode_compatibility(runner=lambda _, result=result: result)
+        assert not compatibility.supported
+        assert not compatibility.posttool_result_replacement
+        assert not compatibility.mcp_tool_injection
+
+
+def test_opencode_replacement_capability_is_true() -> None:
+    compatibility = probe_opencode_compatibility(
+        runner=lambda _: Result(0, "v1.18.4\n")
+    )
+    assert compatibility.posttool_result_replacement is True

@@ -368,7 +368,7 @@ class Registry:
                     (self.session_key,),
                 )
             elif str(row["value"]) != self.session_key:
-                raise CorruptObjectError("registry belongs to a different Codex session")
+                raise CorruptObjectError("registry belongs to a different session")
 
     def schema_version(self) -> int:
         row = self.connection.execute(
@@ -870,6 +870,30 @@ class Registry:
                 (_now(), generation),
             )
             return int(cursor.rowcount)
+
+    def confirm_receipts(self, generation: int, receipt_ids: tuple[int, ...]) -> int:
+        """Confirm only a host-observed snapshot in the still-active generation.
+
+        In particular, a later parallel tool cannot acknowledge a receipt that
+        was created after the model-input snapshot. Stale snapshots are no-ops.
+        """
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise ValueError("invalid receipt generation")
+        if any(isinstance(i, bool) or not isinstance(i, int) or i < 1 for i in receipt_ids):
+            raise ValueError("invalid receipt identity")
+        with self.transaction() as connection:
+            if self.active_generation() != generation or self.active_is_frozen():
+                return 0
+            count = 0
+            for receipt_id in set(receipt_ids):
+                count += connection.execute(
+                    """
+                    UPDATE receipts SET state = 'confirmed', confirmed_at = ?
+                    WHERE generation_id = ? AND receipt_id = ? AND state = 'pending'
+                    """,
+                    (_now(), generation, receipt_id),
+                ).rowcount
+            return count
 
     def pending_receipts(self, generation: int | None = None) -> tuple[PendingReceipt, ...]:
         generation = generation or self.active_generation()

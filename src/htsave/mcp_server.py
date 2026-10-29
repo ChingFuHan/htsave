@@ -1,4 +1,4 @@
-"""Explicit, workspace-contained htsave MCP tools for Codex CLI."""
+"""Explicit, workspace-contained htsave MCP tools for agent CLIs."""
 
 from __future__ import annotations
 
@@ -188,7 +188,8 @@ def tool_definitions() -> list[types.Tool]:
             description=(
                 "Read a UTF-8 regular file inside the active workspace. htsave may "
                 "return FULL, REF, or verified DELTA; use htsave_hydrate when exact "
-                "bytes are needed from a reference. Session metadata is injected by Codex."
+                "bytes are needed from a reference. Session metadata is injected by "
+                "htsave's host hooks."
             ),
             annotations=annotations,
             inputSchema={
@@ -208,7 +209,7 @@ def tool_definitions() -> list[types.Tool]:
             title="Hydrate an htsave reference",
             description=(
                 "Return the byte-exact UTF-8 target for an htsave SHA-256 reference "
-                "owned by the active Codex session."
+                "owned by the active session."
             ),
             annotations=annotations,
             inputSchema={

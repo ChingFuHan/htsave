@@ -25,6 +25,7 @@ _CODEX_SEMVER = re.compile(
 )
 _CODEX_VERSION_OUTPUT = re.compile(r"^codex-cli (?P<version>.+)$")
 _CLAUDE_VERSION = re.compile(r"^([0-9]+)\.([0-9]+)\.([0-9]+)\b")
+_OPENCODE_SEMVER = re.compile(r"^v?([0-9]+\.[0-9]+\.[0-9]+)")
 
 
 class VersionCommandResult(Protocol):
@@ -138,4 +139,39 @@ def probe_claude_compatibility(
         "supported",
         posttool_result_replacement=True,
         pretooluse_updated_input=True,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class OpenCodeCompatibility:
+    """What the installed OpenCode build lets the htsave adapter do."""
+
+    detected_version: str | None
+    supported: bool
+    reason: str
+    posttool_result_replacement: bool = False
+    mcp_tool_injection: bool = False
+
+
+def probe_opencode_compatibility(
+    *, executable: str = "opencode", runner: VersionRunner | None = None
+) -> OpenCodeCompatibility:
+    """Detect OpenCode CLI and report capability flags."""
+
+    try:
+        result = (runner or _run_version)((executable, "--version"))
+    except (OSError, subprocess.SubprocessError):
+        return OpenCodeCompatibility(None, False, "opencode-version-probe-failed")
+    if result.returncode != 0 or not isinstance(result.stdout, str):
+        return OpenCodeCompatibility(None, False, "opencode-version-probe-failed")
+    match = _OPENCODE_SEMVER.match(result.stdout.strip())
+    if match is None:
+        return OpenCodeCompatibility(None, False, "unknown-opencode-version-output")
+    version = match.group(1)
+    return OpenCodeCompatibility(
+        version,
+        True,
+        "capability-compatible",
+        posttool_result_replacement=True,
+        mcp_tool_injection=True,
     )

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "htsave",
+  "description": "Lossless repeated-context saving for Claude Code.",
+  "owner": {
+    "name": "ChingFuHan",
+    "url": "https://github.com/ChingFuHan"
+  },
+  "plugins": [
+    {
+      "name": "htsave",
+      "description": "Replace repeated tool output with exact references and verified deltas.",
+      "source": "./plugin/claude-code",
+      "category": "productivity"
+    }
+  ]
+}

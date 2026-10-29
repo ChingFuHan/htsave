@@ -1,4 +1,4 @@
-"""Lossless repeated-context saving for Codex CLI."""
+"""Lossless repeated-context saving for agent CLIs."""
 
 from __future__ import annotations
 

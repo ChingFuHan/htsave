@@ -40,12 +40,16 @@ from .registry import RecoveryTarget, Registry
 from .tokens import TokenEstimator
 from .transport import render_full_frame
 
-_HTSAVE_MCP_TOOLS: Final = frozenset(
-    {
-        "mcp__htsave__htsave_read",
-        "mcp__htsave__htsave_hydrate",
-    }
-)
+# Claude Code names a plugin's MCP tools ``mcp__plugin_<plugin>_<server>__<tool>``.
+# Capabilities are bound to the canonical name the MCP server checks
+# (``mcp_server.HOOK_*_TOOL``); importing it here would load the MCP SDK on
+# every hook call.
+_HTSAVE_MCP_TOOLS: Final = {
+    "mcp__htsave__htsave_read": "mcp__htsave__htsave_read",
+    "mcp__htsave__htsave_hydrate": "mcp__htsave__htsave_hydrate",
+    "mcp__plugin_htsave_htsave__htsave_read": "mcp__htsave__htsave_read",
+    "mcp__plugin_htsave_htsave__htsave_hydrate": "mcp__htsave__htsave_hydrate",
+}
 _PERMISSION_MODES: Final = frozenset(
     {"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
 )
@@ -480,7 +484,7 @@ def _pre_tool_use(event: PreToolUseEvent, *, state_root: Path | None) -> dict[st
             registry,
             turn_id=event.turn_id,
             tool_use_id=event.tool_use_id,
-            tool_name=event.tool_name,
+            tool_name=_HTSAVE_MCP_TOOLS[event.tool_name],
             arguments=event.tool_input,
             model=_session_model(event, registry) or "",
             cwd=event.cwd,

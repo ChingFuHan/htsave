@@ -112,7 +112,7 @@ def test_legacy_schema_migrates_forward_and_binds_existing_session(tmp_path) -> 
             == paths.session_key
         )
 
-    with pytest.raises(CorruptObjectError, match="different Codex session"):
+    with pytest.raises(CorruptObjectError, match="different session"):
         Registry(paths.database, "wrong-session")
 
 

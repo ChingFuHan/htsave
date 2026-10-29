@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -83,6 +84,38 @@ def ensure_private_file(path: Path) -> None:
         raise SecurityBoundaryError(f"refusing symbolic-link state file: {path}")
     if os.name != "nt" and path.exists():
         os.chmod(path, 0o600)
+
+
+def atomic_write_text(path: Path, content: str, *, mode: int | None = None) -> None:
+    """Durably replace ``path``: a crash leaves the old or the new file, never a mix.
+
+    ``mode`` is applied on POSIX; ``None`` keeps an existing file's mode and
+    creates new files as ``0600``.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if mode is None:
+        mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if os.name != "nt":
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def build_state_paths(session_id: str, root: Path | None = None) -> StatePaths:

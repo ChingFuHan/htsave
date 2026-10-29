@@ -1,20 +1,26 @@
-"""Reversible htsave integration for Claude Code's settings file.
+"""Reversible htsave integration for Claude Code, delivered as a plugin.
 
-Claude Code has no plugin marketplace to own, so the integration is a set of
-hook entries in ``settings.json`` plus one MCP server registration.  The
-operator's own hooks live in the same file — this machine already runs `rtk`
-and `caveman` handlers on most events — so every write is additive and every
-htsave-owned entry is tagged, letting install, status, and uninstall recognize
-exactly what belongs to htsave and touch nothing else.
+The plugin (``plugin/claude-code``, listed by the repository's
+``.claude-plugin/marketplace.json``) carries the lifecycle hooks, the MCP
+server, and the skill; its commands run the htsave runtime from PATH.  This
+module drives ``claude plugin`` to install it, and removes what older htsave
+releases wrote directly: hook entries and an ``mcpServers`` entry in
+``settings.json``, plus a skill file.  The operator's own hooks live in the
+same settings file — this machine already runs `rtk` and `caveman` handlers on
+most events — so cleanup touches only what it recognizes as htsave's.
+
+``install_hooks`` still writes hook entries directly; the paired benchmark uses
+it inside an isolated ``CLAUDE_CONFIG_DIR``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
-import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -23,19 +29,28 @@ from typing import Any
 from . import __version__
 from .errors import HtsaveError
 from .mcp_server import READ_TOOL
-from .plugin import HOOK_MODULE, MCP_MODULE, PLUGIN_NAME
+from .paths import atomic_write_text
+from .plugin import HOOK_MODULE, MCP_MODULE, PLUGIN_NAME, CommandResult
 
 CLAUDE_HOOK_MODULE = "htsave.claude_hooks"
+MARKETPLACE_NAME = "htsave"
+PLUGIN_ID = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
+DEFAULT_MARKETPLACE = "ChingFuHan/htsave"
+# The plugin's hooks and MCP server run these console scripts from PATH.
+RUNTIME_COMMANDS: tuple[str, ...] = ("htsave-claude-hook", "htsave-mcp")
 # The interpreter path is deliberately *not* resolved: a virtualenv's
 # ``bin/python`` is a symlink to the base interpreter, and following it points
 # the hook at a Python that cannot import htsave.
 OWNER_KEY = "htsaveOwned"
-SETTINGS_RELATIVE = Path(".claude") / "settings.json"
-SKILL_RELATIVE = Path(".claude") / "skills" / "htsave.md"
-SKILL_MANAGED_KEY = "htsave-managed"
+CLAUDE_CONFIG_ENV = "CLAUDE_CONFIG_DIR"
+# Skill files older releases wrote; the plugin now ships the skill.
+LEGACY_SKILLS: tuple[Path, ...] = (
+    Path("skills") / "htsave.md",
+    Path("skills") / "htsave" / "SKILL.md",
+)
 # Every lifecycle event the adapter acts on.  Matchers stay absent so Claude
 # Code runs the handler for every tool; the adapter itself decides what is
-# unambiguous enough to touch.
+# unambiguous enough to touch.  The plugin's hooks.json lists the same events.
 HOOK_EVENTS: tuple[str, ...] = (
     "SessionStart",
     "PreToolUse",
@@ -47,6 +62,9 @@ HOOK_EVENTS: tuple[str, ...] = (
     "Stop",
 )
 HOOK_TIMEOUT_SECONDS = 30
+_CLAUDE_COMMAND_TIMEOUT_SECONDS = 120
+
+ClaudeRunner = Callable[[Sequence[str], Mapping[str, str]], CommandResult]
 
 
 class ClaudeIntegrationError(HtsaveError):
@@ -65,10 +83,9 @@ class ClaudeIntegrationStatus:
     settings_path: Path
     expected_version: str
     installed_version: str | None
-    hook_events: tuple[str, ...]
-    mcp_registered: bool
+    plugin_enabled: bool
+    runtime_on_path: bool
     foreign_hook_handlers: int
-    skill_installed: bool = False
     drifts: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -76,40 +93,104 @@ class ClaudeIntegrationStatus:
         return self.state is ClaudeIntegrationState.INSTALLED and not self.drifts
 
 
+def _default_config_dir(home: Path | None = None) -> Path:
+    configured = os.environ.get(CLAUDE_CONFIG_ENV)
+    if home is None and configured:
+        return Path(configured).expanduser()
+    return (home or Path.home()) / ".claude"
+
+
 def default_settings_path(home: Path | None = None) -> Path:
-    return (home or Path.home()) / SETTINGS_RELATIVE
+    return _default_config_dir(home) / "settings.json"
 
 
-def default_skill_path(home: Path | None = None) -> Path:
-    return (home or Path.home()) / SKILL_RELATIVE
+def _config_dir(settings_path: Path | None) -> Path | None:
+    """The config directory a settings override belongs to; ``None`` is Claude's default."""
+
+    if settings_path is None or settings_path == default_settings_path():
+        return None
+    return settings_path.parent
 
 
-def _resolve_skill_path(settings_path: Path | None, skill_path: Path | None) -> Path:
-    if skill_path is not None:
-        return skill_path
-    if settings_path is not None:
-        return settings_path.parent / "skills" / "htsave.md"
-    return default_skill_path()
-
-
-def _claude_skill_template() -> str:
-    """Load the Claude Code skill template from the packaged plugin tree."""
-    packaged = (
-        Path(__file__).resolve().parent / "_plugin" / "htsave" / "skills" / "claude" / "htsave.md"
+def _default_runner(argv: Sequence[str], env: Mapping[str, str]) -> CommandResult:
+    return subprocess.run(
+        list(argv),
+        capture_output=True,
+        text=True,
+        check=False,
+        env=dict(env),
+        timeout=_CLAUDE_COMMAND_TIMEOUT_SECONDS,
     )
-    if packaged.is_file():
-        return packaged.read_text(encoding="utf-8")
-    source = (
-        Path(__file__).resolve().parents[2]
-        / "plugin"
-        / "htsave"
-        / "skills"
-        / "claude"
-        / "htsave.md"
-    )
-    if source.is_file():
-        return source.read_text(encoding="utf-8")
-    raise ClaudeIntegrationError("packaged Claude Code skill template is missing")
+
+
+class ClaudeClient:
+    """Small wrapper around the ``claude plugin`` commands htsave needs."""
+
+    def __init__(
+        self,
+        config_dir: Path | None = None,
+        *,
+        runner: ClaudeRunner | None = None,
+        executable: str = "claude",
+    ) -> None:
+        self._config_dir = config_dir
+        self._runner = runner or _default_runner
+        self._executable = executable
+
+    def plugin(self, plugin_id: str) -> Mapping[str, Any] | None:
+        for record in self._json("plugin", "list", "--json"):
+            if isinstance(record, Mapping) and record.get("id") == plugin_id:
+                return record
+        return None
+
+    def has_marketplace(self, name: str) -> bool:
+        return any(
+            isinstance(record, Mapping) and record.get("name") == name
+            for record in self._json("plugin", "marketplace", "list", "--json")
+        )
+
+    def add_marketplace(self, source: str) -> None:
+        self._run("plugin", "marketplace", "add", source)
+
+    def remove_marketplace(self, name: str) -> None:
+        self._run("plugin", "marketplace", "remove", name)
+
+    def install_plugin(self, plugin_id: str) -> None:
+        self._run("plugin", "install", plugin_id, "--scope", "user")
+
+    def uninstall_plugin(self, plugin_id: str) -> None:
+        self._run("plugin", "uninstall", plugin_id, "--scope", "user")
+
+    def _json(self, *arguments: str) -> list[Any]:
+        stdout = self._run(*arguments)
+        try:
+            value = json.loads(stdout)
+        except json.JSONDecodeError as error:
+            raise ClaudeIntegrationError(
+                f"Claude Code returned invalid JSON: claude {' '.join(arguments)}"
+            ) from error
+        if not isinstance(value, list):
+            raise ClaudeIntegrationError(
+                f"Claude Code returned an unexpected shape: claude {' '.join(arguments)}"
+            )
+        return value
+
+    def _run(self, *arguments: str) -> str:
+        argv = (self._executable, *arguments)
+        env = dict(os.environ)
+        if self._config_dir is not None:
+            env[CLAUDE_CONFIG_ENV] = str(self._config_dir)
+        try:
+            result = self._runner(argv, env)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ClaudeIntegrationError(f"could not execute {self._executable}") from error
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip() or (result.stdout or "").strip()
+            raise ClaudeIntegrationError(
+                f"Claude Code command failed: {' '.join(argv)}: "
+                f"{detail or f'exit status {result.returncode}'}"
+            )
+        return result.stdout or ""
 
 
 def _is_owned_skill(path: Path) -> bool:
@@ -122,46 +203,13 @@ def _is_owned_skill(path: Path) -> bool:
         return False
 
 
-def _install_skill(
-    skill_path: Path | None = None, settings_path: Path | None = None
-) -> None:
-    target = _resolve_skill_path(settings_path, skill_path)
-    if target.exists() and not _is_owned_skill(target):
-        raise ClaudeIntegrationError(
-            f"skill file '{target}' already exists and is not owned by htsave"
-        )
-    target.parent.mkdir(parents=True, exist_ok=True)
-    content = _claude_skill_template()
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=target.parent, prefix=".htsave-skill.", suffix=".tmp"
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if os.name != "nt":
-            os.chmod(temporary, 0o600)
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _uninstall_skill(
-    skill_path: Path | None = None, settings_path: Path | None = None
-) -> None:
-    target = _resolve_skill_path(settings_path, skill_path)
-    if not target.exists():
+def _remove_owned_skill(path: Path) -> None:
+    if not _is_owned_skill(path):
         return
-    if not _is_owned_skill(target):
-        return
-    target.unlink()
-    # Clean up empty directory if applicable
-    skill_dir = target.parent
-    if skill_dir.is_dir() and not any(skill_dir.iterdir()):
+    path.unlink()
+    skill_dir = path.parent
+    if skill_dir.name == PLUGIN_NAME and not any(skill_dir.iterdir()):
         skill_dir.rmdir()
-
 
 
 def _read_settings(path: Path) -> dict[str, Any]:
@@ -179,22 +227,7 @@ def _read_settings(path: Path) -> dict[str, Any]:
 def _write_settings(path: Path, payload: Mapping[str, Any]) -> None:
     """Replace the settings file atomically, preserving its permissions."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent, prefix=".settings.", suffix=".tmp"
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(payload, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        if os.name != "nt":
-            os.chmod(temporary, path.stat().st_mode & 0o777 if path.exists() else 0o600)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
 
 def _handler(python_executable: Path) -> dict[str, Any]:
@@ -206,25 +239,30 @@ def _handler(python_executable: Path) -> dict[str, Any]:
     }
 
 
-def _is_owned(handler: object) -> bool:
-    if not isinstance(handler, Mapping):
-        return False
-    marker = handler.get(OWNER_KEY)
+def _has_owner_marker(value: Mapping[str, Any]) -> bool:
+    marker = value.get(OWNER_KEY)
     return isinstance(marker, Mapping) and marker.get("owner") == PLUGIN_NAME
 
 
-def _owned_version(handler: Mapping[str, Any]) -> str | None:
-    marker = handler.get(OWNER_KEY)
-    version = marker.get("version") if isinstance(marker, Mapping) else None
-    return version if isinstance(version, str) else None
+def _is_owned(handler: object) -> bool:
+    """Recognize htsave's hook handler by its marker or its htsave-only command.
+
+    Claude Code can drop unknown handler keys when it rewrites settings.json,
+    which loses the marker; the hook module in the command is htsave's alone.
+    """
+
+    if not isinstance(handler, Mapping):
+        return False
+    command = handler.get("command")
+    return _has_owner_marker(handler) or (
+        isinstance(command, str) and command.endswith(f" -m {CLAUDE_HOOK_MODULE}")
+    )
 
 
-def _mcp_server(python_executable: Path) -> dict[str, Any]:
-    return {
-        "command": str(python_executable),
-        "args": ["-m", MCP_MODULE],
-        OWNER_KEY: {"owner": PLUGIN_NAME, "version": __version__},
-    }
+def _is_owned_mcp(server: object) -> bool:
+    if not isinstance(server, Mapping):
+        return False
+    return _has_owner_marker(server) or server.get("args") == ["-m", MCP_MODULE]
 
 
 def _groups(settings: Mapping[str, Any], event: str) -> list[Any]:
@@ -241,32 +279,31 @@ def _groups(settings: Mapping[str, Any], event: str) -> list[Any]:
     return list(groups)
 
 
-def _owned_handlers(settings: Mapping[str, Any], event: str) -> list[Mapping[str, Any]]:
-    found: list[Mapping[str, Any]] = []
-    for group in _groups(settings, event):
-        if not isinstance(group, Mapping):
-            continue
-        handlers = group.get("hooks")
-        if not isinstance(handlers, list):
-            continue
-        found.extend(handler for handler in handlers if _is_owned(handler))
+def _handlers(settings: Mapping[str, Any]) -> list[object]:
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, Mapping):
+        return []
+    found: list[object] = []
+    for event in hooks:
+        for group in _groups(settings, event):
+            if isinstance(group, Mapping) and isinstance(group.get("hooks"), list):
+                found.extend(group["hooks"])
     return found
 
 
 def _count_foreign_handlers(settings: Mapping[str, Any]) -> int:
-    hooks = settings.get("hooks")
-    if not isinstance(hooks, Mapping):
-        return 0
-    total = 0
-    for event in hooks:
-        for group in _groups(settings, event):
-            if not isinstance(group, Mapping):
-                continue
-            handlers = group.get("hooks")
-            if not isinstance(handlers, list):
-                continue
-            total += sum(1 for handler in handlers if not _is_owned(handler))
-    return total
+    return sum(1 for handler in _handlers(settings) if not _is_owned(handler))
+
+
+def _legacy_settings_hooks(settings: Mapping[str, Any]) -> bool:
+    return any(_is_owned(handler) for handler in _handlers(settings))
+
+
+def _legacy_settings_server(settings: Mapping[str, Any]) -> bool:
+    """Older releases put the MCP server in settings.json, which Claude Code ignores."""
+
+    servers = settings.get("mcpServers")
+    return isinstance(servers, Mapping) and _is_owned_mcp(servers.get(PLUGIN_NAME))
 
 
 def _strip_owned(settings: dict[str, Any]) -> dict[str, Any]:
@@ -301,7 +338,9 @@ def _strip_owned(settings: dict[str, Any]) -> dict[str, Any]:
 
     servers = settings.get("mcpServers")
     if isinstance(servers, Mapping):
-        kept_servers = {name: value for name, value in servers.items() if not _is_owned(value)}
+        kept_servers = {
+            name: value for name, value in servers.items() if not _is_owned_mcp(value)
+        }
         if kept_servers:
             settings["mcpServers"] = kept_servers
         else:
@@ -309,93 +348,28 @@ def _strip_owned(settings: dict[str, Any]) -> dict[str, Any]:
     return settings
 
 
-def status(
-    *,
-    settings_path: Path | None = None,
-    python_executable: Path | None = None,
-    skill_path: Path | None = None,
-) -> ClaudeIntegrationStatus:
-    """Report what htsave owns in the settings file and skills without changing anything."""
-
-    path = settings_path or default_settings_path()
-    interpreter = (python_executable or Path(sys.executable)).expanduser()
-    settings = _read_settings(path)
-
-    skill_target = _resolve_skill_path(settings_path, skill_path)
-    skill_installed = _is_owned_skill(skill_target)
-
-    installed_events: list[str] = []
-    versions: set[str] = set()
+def _legacy_drifts(settings: Mapping[str, Any], config_dir: Path) -> list[str]:
     drifts: list[str] = []
-    expected_command = _handler(interpreter)["command"]
-    for event in HOOK_EVENTS:
-        handlers = _owned_handlers(settings, event)
-        if not handlers:
-            continue
-        installed_events.append(event)
-        if len(handlers) > 1:
-            drifts.append(f"duplicate-handler:{event}")
-        for handler in handlers:
-            version = _owned_version(handler)
-            if version is not None:
-                versions.add(version)
-            if handler.get("command") != expected_command:
-                drifts.append(f"interpreter-mismatch:{event}")
-
-    servers = settings.get("mcpServers")
-    server = servers.get(PLUGIN_NAME) if isinstance(servers, Mapping) else None
-    mcp_registered = _is_owned(server)
-    if mcp_registered and isinstance(server, Mapping):
-        if server.get("command") != str(interpreter) or server.get("args") != ["-m", MCP_MODULE]:
-            drifts.append("mcp-server-mismatch")
-    elif server is not None and not mcp_registered:
-        drifts.append("mcp-server-not-owned")
-
-    if not installed_events and not mcp_registered and not skill_installed:
-        state = ClaudeIntegrationState.NOT_INSTALLED
-    elif (
-        sorted(installed_events) == sorted(HOOK_EVENTS)
-        and mcp_registered
-        and skill_installed
-        and not drifts
-    ):
-        state = ClaudeIntegrationState.INSTALLED
-    else:
-        state = ClaudeIntegrationState.DRIFTED
-        missing = sorted(set(HOOK_EVENTS) - set(installed_events))
-        drifts.extend(f"missing-event:{event}" for event in missing)
-        if not mcp_registered:
-            drifts.append("mcp-server-not-registered")
-        if not skill_installed and (installed_events or mcp_registered):
-            drifts.append("skill-not-installed")
-
-    installed_version = versions.pop() if len(versions) == 1 else None
-    return ClaudeIntegrationStatus(
-        state=state,
-        settings_path=path,
-        expected_version=__version__,
-        installed_version=installed_version,
-        hook_events=tuple(sorted(installed_events)),
-        mcp_registered=mcp_registered,
-        foreign_hook_handlers=_count_foreign_handlers(settings),
-        skill_installed=skill_installed,
-        drifts=tuple(dict.fromkeys(drifts)),
-    )
+    if _legacy_settings_hooks(settings):
+        drifts.append("legacy-settings-hooks")
+    if _legacy_settings_server(settings):
+        drifts.append("legacy-settings-mcp-server")
+    if any(_is_owned_skill(config_dir / relative) for relative in LEGACY_SKILLS):
+        drifts.append("legacy-skill")
+    return drifts
 
 
-def install(
-    *,
-    settings_path: Path | None = None,
-    python_executable: Path | None = None,
-    skill_path: Path | None = None,
-) -> ClaudeIntegrationStatus:
-    """Add htsave's hooks, MCP server, and skill, leaving every foreign entry intact."""
+def _remove_legacy(path: Path) -> None:
+    """Remove what older releases wrote, which would duplicate the plugin's hooks."""
 
-    path = settings_path or default_settings_path()
-    interpreter = (python_executable or Path(sys.executable)).expanduser()
     settings = _read_settings(path)
-    foreign_before = _count_foreign_handlers(settings)
+    if _legacy_settings_hooks(settings) or _legacy_settings_server(settings):
+        _write_settings(path, _strip_owned(settings))
+    for relative in LEGACY_SKILLS:
+        _remove_owned_skill(path.parent / relative)
 
+
+def _with_owned_hooks(settings: dict[str, Any], interpreter: Path) -> dict[str, Any]:
     # Removing first makes a re-install idempotent instead of accumulating.
     settings = _strip_owned(settings)
     hooks = dict(settings.get("hooks") or {})
@@ -404,28 +378,97 @@ def install(
         groups.append({"hooks": [_handler(interpreter)]})
         hooks[event] = groups
     settings["hooks"] = hooks
+    return settings
 
-    servers = dict(settings.get("mcpServers") or {})
-    existing = servers.get(PLUGIN_NAME)
-    if existing is not None and not _is_owned(existing):
-        raise ClaudeIntegrationError(
-            f"MCP server '{PLUGIN_NAME}' already exists and is not owned by htsave"
+
+def status(
+    *,
+    settings_path: Path | None = None,
+    claude: ClaudeClient | None = None,
+) -> ClaudeIntegrationStatus:
+    """Report the plugin, its runtime, and any legacy leftovers without changing anything."""
+
+    path = settings_path or default_settings_path()
+    client = claude or ClaudeClient(_config_dir(settings_path))
+    settings = _read_settings(path)
+    drifts = _legacy_drifts(settings, path.parent)
+    plugin = client.plugin(PLUGIN_ID)
+    runtime_on_path = all(shutil.which(command) for command in RUNTIME_COMMANDS)
+    enabled = plugin is not None and plugin.get("enabled") is True
+    version = plugin.get("version") if plugin is not None else None
+    installed_version = version if isinstance(version, str) else None
+
+    if plugin is None:
+        state = (
+            ClaudeIntegrationState.DRIFTED if drifts else ClaudeIntegrationState.NOT_INSTALLED
         )
-    servers[PLUGIN_NAME] = _mcp_server(interpreter)
-    settings["mcpServers"] = servers
+        if drifts:
+            drifts.append("plugin-not-installed")
+    else:
+        if not enabled:
+            drifts.append("plugin-disabled")
+        if installed_version != __version__:
+            drifts.append("plugin-version-mismatch")
+        if not runtime_on_path:
+            drifts.append("runtime-not-on-path")
+        state = ClaudeIntegrationState.DRIFTED if drifts else ClaudeIntegrationState.INSTALLED
 
-    _install_skill(skill_path, settings_path=path)
-    _write_settings(path, settings)
-    result = status(
-        settings_path=path, python_executable=interpreter, skill_path=skill_path
+    return ClaudeIntegrationStatus(
+        state=state,
+        settings_path=path,
+        expected_version=__version__,
+        installed_version=installed_version,
+        plugin_enabled=enabled,
+        runtime_on_path=runtime_on_path,
+        foreign_hook_handlers=_count_foreign_handlers(settings),
+        drifts=tuple(drifts),
     )
+
+
+def install_hooks(*, settings_path: Path, python_executable: Path | None = None) -> None:
+    """Add only htsave's lifecycle hooks to a settings file.
+
+    The paired benchmark uses this inside an isolated ``CLAUDE_CONFIG_DIR``: it
+    measures the transparent replacement path alone, with ``--strict-mcp-config``
+    keeping every MCP server out of both arms.
+    """
+
+    interpreter = (python_executable or Path(sys.executable)).expanduser()
+    _write_settings(settings_path, _with_owned_hooks(_read_settings(settings_path), interpreter))
+
+
+def install(
+    *,
+    marketplace: str = DEFAULT_MARKETPLACE,
+    settings_path: Path | None = None,
+    claude: ClaudeClient | None = None,
+) -> ClaudeIntegrationStatus:
+    """Install the htsave plugin and remove legacy entries that would duplicate it."""
+
+    path = settings_path or default_settings_path()
+    client = claude or ClaudeClient(_config_dir(settings_path))
+    foreign_before = _count_foreign_handlers(_read_settings(path))
+
+    # The external commands are the likeliest step to fail, so they run before
+    # any local cleanup.
+    if not client.has_marketplace(MARKETPLACE_NAME):
+        client.add_marketplace(marketplace)
+    client.install_plugin(PLUGIN_ID)
+    _remove_legacy(path)
+
+    result = status(settings_path=path, claude=client)
     if result.foreign_hook_handlers != foreign_before:
         raise ClaudeIntegrationError(
             "install changed the operator's own hook handlers; settings were not preserved"
         )
     if not result.healthy:
+        hint = (
+            "; install the runtime with `uv tool install htsave`"
+            if "runtime-not-on-path" in result.drifts
+            else ""
+        )
         raise ClaudeIntegrationError(
-            f"Claude Code install verification failed: {result.state.value}"
+            f"Claude Code install verification failed: {', '.join(result.drifts)}{hint}"
         )
     return result
 
@@ -433,32 +476,29 @@ def install(
 def uninstall(
     *,
     settings_path: Path | None = None,
-    python_executable: Path | None = None,
     confirm: bool = False,
-    skill_path: Path | None = None,
+    claude: ClaudeClient | None = None,
 ) -> dict[str, Any]:
-    """Remove only htsave-owned entries.  Session data is never touched."""
+    """Remove the plugin, its marketplace, and legacy entries.  Session data is never touched."""
 
     path = settings_path or default_settings_path()
-    interpreter = (python_executable or Path(sys.executable)).expanduser()
-    before = status(
-        settings_path=path, python_executable=interpreter, skill_path=skill_path
-    )
+    client = claude or ClaudeClient(_config_dir(settings_path))
+    before = status(settings_path=path, claude=client)
     if not confirm:
         return {
             "dry_run": True,
             "would_remove_integration": before.state is not ClaudeIntegrationState.NOT_INSTALLED,
             "session_data_preserved": True,
-            "hint": "rerun with --yes to remove the managed Claude Code integration",
+            "hint": "rerun with --yes to remove the Claude Code plugin",
             "status": before,
         }
 
-    settings = _strip_owned(_read_settings(path))
-    _write_settings(path, settings)
-    _uninstall_skill(skill_path, settings_path=path)
-    after = status(
-        settings_path=path, python_executable=interpreter, skill_path=skill_path
-    )
+    if client.plugin(PLUGIN_ID) is not None:
+        client.uninstall_plugin(PLUGIN_ID)
+    if client.has_marketplace(MARKETPLACE_NAME):
+        client.remove_marketplace(MARKETPLACE_NAME)
+    _remove_legacy(path)
+    after = status(settings_path=path, claude=client)
     if after.foreign_hook_handlers != before.foreign_hook_handlers:
         raise ClaudeIntegrationError(
             "uninstall changed the operator's own hook handlers; settings were not preserved"
@@ -470,15 +510,15 @@ def uninstall(
     }
 
 
-def integration_summary(python_executable: Path | None = None) -> dict[str, Any]:
+def integration_summary() -> dict[str, Any]:
     """Small description used by ``htsave doctor``."""
 
-    interpreter = (python_executable or Path(sys.executable)).expanduser()
     return {
+        "plugin": PLUGIN_ID,
+        "runtime_commands": list(RUNTIME_COMMANDS),
         "hook_module": CLAUDE_HOOK_MODULE,
         "mcp_module": MCP_MODULE,
         "mcp_tool": READ_TOOL,
         "codex_hook_module": HOOK_MODULE,
-        "python": str(interpreter),
         "events": list(HOOK_EVENTS),
     }

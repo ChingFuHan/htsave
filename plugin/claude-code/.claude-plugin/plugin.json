@@ -1,0 +1,11 @@
+{
+  "name": "htsave",
+  "version": "1.0.0",
+  "description": "Lossless repeated-context saving: repeated tool output becomes an exact REF or a verified DELTA. Requires the htsave runtime on PATH (uv tool install htsave).",
+  "author": {
+    "name": "ChingFuHan",
+    "url": "https://github.com/ChingFuHan"
+  },
+  "homepage": "https://github.com/ChingFuHan/htsave",
+  "license": "MIT"
+}

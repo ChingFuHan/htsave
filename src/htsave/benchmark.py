@@ -1,8 +1,9 @@
-"""Deterministic parsing and release gates for Codex benchmark results.
+"""Deterministic parsing and release gates for paired host benchmark results.
 
-This module deliberately does not launch Codex.  It consumes the public JSONL
-stream produced by ``codex exec --json`` and evaluates already-paired usage
-measurements without reading persisted sessions or rollout transcripts.
+This module deliberately does not launch a host CLI.  It consumes each host's
+public machine-readable output (e.g. ``codex exec --json``) and evaluates
+already-paired usage measurements without reading persisted sessions or
+rollout transcripts.
 """
 
 from __future__ import annotations
@@ -34,13 +35,14 @@ DEFAULT_BENCHMARK_PATH: BenchmarkPath = "mcp"
 
 # Which agent CLI is measured.  Claude Code is the default for the transparent
 # path; Codex and agy exercise the explicit MCP path they support today.
-Host = Literal["agy", "claude", "codex"]
-BENCHMARK_HOSTS: tuple[Host, ...] = ("agy", "claude", "codex")
+Host = Literal["agy", "claude", "codex", "opencode"]
+BENCHMARK_HOSTS: tuple[Host, ...] = ("agy", "claude", "codex", "opencode")
 DEFAULT_HOST: Host = "claude"
 DEFAULT_PATH_FOR_HOST: dict[Host, BenchmarkPath] = {
     "agy": "mcp",
     "claude": "shell",
     "codex": "mcp",
+    "opencode": "mcp",
 }
 
 _USAGE_FIELDS = (
@@ -520,6 +522,86 @@ def parse_agy_exec_json(payload: str) -> ProtocolResult:
     )
     return ProtocolResult(
         thread_id=conversation_id,
+        terminal="completed",
+        usage=usage,
+        event_counts=event_counts,
+        errors=tuple(errors),
+    )
+
+
+def parse_opencode_exec_json(payload: str) -> ProtocolResult:
+    """Parse OpenCode's ``opencode run --format json`` NDJSON stream.
+
+    Follows the same contract as the agy parser: looks for a ``result``
+    event containing ``session_id``, ``status``, and ``usage``.
+    """
+
+    event_counts: Counter[str] = Counter()
+    errors: list[str] = []
+    result_value: Mapping[str, object] | None = None
+    for line_number, line in enumerate(payload.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CodexExecProtocolError(f"line {line_number}: malformed JSON: {exc.msg}") from exc
+        if not isinstance(event, dict):
+            raise CodexExecProtocolError(f"line {line_number}: event must be an object")
+        event_name = event.get("event")
+        if not isinstance(event_name, str) or not event_name:
+            raise CodexExecProtocolError(f"line {line_number}: event name must be a string")
+        event_counts[event_name] += 1
+        if event_name == "error":
+            errors.append(_event_error(event, "opencode error"))
+        if event_name == "result":
+            value = event.get("result")
+            if not isinstance(value, dict):
+                raise CodexExecProtocolError(
+                    f"line {line_number}: opencode result must be an object"
+                )
+            if result_value is not None:
+                raise CodexExecProtocolError("duplicate opencode result event")
+            result_value = value
+
+    if result_value is None:
+        raise CodexExecProtocolError("missing opencode result event")
+    session_id = result_value.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise CodexExecProtocolError("opencode result is missing session_id")
+    status = result_value.get("status")
+    if status != "completed":
+        detail = result_value.get("error") or status or "unknown"
+        errors.append(f"opencode terminal state: {detail}")
+        return ProtocolResult(
+            thread_id=session_id,
+            terminal="failed",
+            usage=None,
+            event_counts=event_counts,
+            errors=tuple(errors),
+        )
+    usage_value = result_value.get("usage")
+    if not isinstance(usage_value, dict):
+        raise CodexExecProtocolError("opencode result is missing usage")
+
+    def count(name: str, *, required: bool = False) -> int:
+        value = usage_value.get(name)
+        if value is None and not required:
+            return 0
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise CodexExecProtocolError(
+                f"opencode usage field {name} must be a non-negative integer"
+            )
+        return value
+
+    usage = Usage(
+        input_tokens=count("input_tokens", required=True),
+        cached_input_tokens=count("cached_input_tokens"),
+        output_tokens=count("output_tokens", required=True),
+        reasoning_output_tokens=count("reasoning_output_tokens"),
+    )
+    return ProtocolResult(
+        thread_id=session_id,
         terminal="completed",
         usage=usage,
         event_counts=event_counts,

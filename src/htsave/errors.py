@@ -22,4 +22,4 @@ class SecurityBoundaryError(HtsaveError):
 
 
 class CompatibilityError(HtsaveError):
-    """The active Codex contract is not supported safely."""
+    """The active host contract is not supported safely."""

@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "htsave"
 version = "1.0.0"
-description = "Lossless repeated-context saving for Codex CLI"
+description = "Lossless repeated-context saving for agent CLIs"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-keywords = ["codex", "context", "deduplication", "mcp"]
+keywords = ["claude-code", "codex", "context", "deduplication", "mcp"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: Console",
@@ -41,6 +41,9 @@ dev = [
 
 [project.scripts]
 htsave = "htsave.cli:main"
+# Claude Code plugin commands: they import only what each entry point needs.
+htsave-claude-hook = "htsave.claude_hooks:main"
+htsave-mcp = "htsave.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/htsave"]

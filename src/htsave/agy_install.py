@@ -13,9 +13,7 @@ identification during status checks and uninstall.
 from __future__ import annotations
 
 import json
-import os
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -24,6 +22,7 @@ from typing import Any
 from . import __version__
 from .agy_hooks import SESSION_START_ARG
 from .errors import HtsaveError
+from .paths import atomic_write_text
 from .plugin import MCP_MODULE, PLUGIN_NAME
 
 OWNER_KEY = "htsaveOwned"
@@ -57,27 +56,6 @@ class AgyIntegrationStatus:
         return self.state is AgyIntegrationState.INSTALLED and not self.drifts
 
 
-# ── Atomic I/O helpers ──────────────────────────────────────────────────────
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, tmp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        if os.name != "nt":
-            os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
 def _read_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
@@ -96,7 +74,9 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    _atomic_write(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    atomic_write_text(
+        path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n", mode=0o600
+    )
 
 
 def _is_owned_entry(entry: object) -> bool:
@@ -131,7 +111,7 @@ def _skill_template() -> str:
 def _install_skill(home: Path | None = None) -> Path:
     target = (home or Path.home()) / SKILL_RELATIVE
     target.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(target, _skill_template())
+    atomic_write_text(target, _skill_template(), mode=0o600)
     return target
 
 

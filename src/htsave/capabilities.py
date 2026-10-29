@@ -1,4 +1,4 @@
-"""One-use, session-scoped capabilities for the Codex hook-to-MCP boundary."""
+"""One-use, session-scoped capabilities for the host hook-to-MCP boundary."""
 
 from __future__ import annotations
 

@@ -50,7 +50,7 @@ class DecisionPolicy:
 
 
 class ContextEngine:
-    """Own the CAS/receipt invariants independently from any Codex wire format."""
+    """Own the CAS/receipt invariants independently from any host wire format."""
 
     def __init__(
         self,
@@ -370,7 +370,7 @@ class ContextEngine:
     def hydrate_bytes(self, object_hash: str) -> bytes:
         metadata = self.registry.object_metadata(object_hash)
         if metadata is None:
-            raise CorruptObjectError("object is not registered in this Codex session")
+            raise CorruptObjectError("object is not registered in this session")
         content = self.cas.get(object_hash)
         if int(metadata["byte_size"]) != len(content):
             raise CorruptObjectError("registered object byte size does not match CAS")

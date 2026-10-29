@@ -1,7 +1,7 @@
-"""Paid-call-gated harness for deterministic paired Codex benchmarks.
+"""Paid-call-gated harness for deterministic paired host benchmarks.
 
 The runner owns fixture generation, process isolation, manifest persistence, and
-resume behavior.  It never launches Codex unless the caller explicitly passes
+resume behavior.  It never launches a host CLI unless the caller explicitly passes
 ``confirm_paid_runs=True``.  Token parsing and release arithmetic remain in
 ``htsave.benchmark``.
 """
@@ -40,11 +40,19 @@ from htsave.benchmark import (
     parse_agy_exec_json,
     parse_claude_exec_json,
     parse_codex_exec_jsonl,
+    parse_opencode_exec_json,
 )
-from htsave.claude_install import install as install_claude_integration
-from htsave.compat import probe_claude_compatibility, probe_codex_compatibility
+from htsave.claude_install import install_hooks as install_claude_hooks
+from htsave.compat import (
+    probe_claude_compatibility,
+    probe_codex_compatibility,
+    probe_opencode_compatibility,
+)
 from htsave.errors import CompatibilityError
+from htsave.opencode_install import install as install_opencode_integration
+from htsave.paths import atomic_write_text
 from htsave.plugin import MCP_MODULE, PLUGIN_NAME, load_rendered_hooks
+from htsave.tokens import tiktoken_cache_dir
 
 MANIFEST_SCHEMA_VERSION = 3
 PAIR_COUNT = REQUIRED_PAIRS
@@ -54,6 +62,7 @@ DEFAULT_MODEL_FOR_HOST: dict[str, str] = {
     "agy": "gemini-3.7-flash-low",
     "claude": "claude-opus-5",
     "codex": "gpt-5.6-sol",
+    "opencode": "opencode/big-pickle",
 }
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _PACKAGED_TEMPLATE_ROOT = Path(__file__).resolve().parent / "_benchmark_templates"
@@ -478,6 +487,15 @@ def resume_release_benchmark(
 def _require_paid_contract(host: Host, executable: str, path: BenchmarkPath) -> None:
     """Refuse paid runs whose measured delivery path the host cannot serve."""
 
+    if host == "opencode":
+        if path != "mcp":
+            raise CompatibilityError("OpenCode paid benchmark requires the explicit MCP path")
+        opencode = probe_opencode_compatibility(executable=executable)
+        if not opencode.supported:
+            raise CompatibilityError(
+                f"paid benchmark requires a supported OpenCode build: {opencode.reason}"
+            )
+        return
     if host == "agy":
         if path != "mcp":
             raise CompatibilityError("agy paid benchmark requires the explicit MCP path")
@@ -777,6 +795,8 @@ def _host_argv(
         return _agy_argv(executable, model, reasoning_effort, path)
     if host == "claude":
         return _claude_argv(executable, model, path)
+    if host == "opencode":
+        return _opencode_argv(executable, model, path)
     return _codex_argv(executable, model, reasoning_effort, path, python_executable)
 
 
@@ -901,6 +921,20 @@ def _codex_argv(
     )
 
 
+def _opencode_argv(executable: str, model: str, path: BenchmarkPath) -> tuple[str, ...]:
+    if path != "mcp":
+        raise ValueError("the OpenCode benchmark measures its explicit MCP path")
+    return (
+        executable,
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        model,
+    )
+
+
 def _run_pending(
     manifest_path: Path,
     manifest: ReleaseManifest,
@@ -971,11 +1005,23 @@ def _run_attempt(
                 "HTSAVE_BENCH_ARTIFACTS": str(artifacts.resolve()),
                 "HTSAVE_BENCH_ARM": execution.arm,
                 "HTSAVE_BENCH_WORKSPACE": str(workspace.resolve()),
+                # agy's isolated HOME must not hide the shared encoding cache.
+                "TIKTOKEN_CACHE_DIR": tiktoken_cache_dir(),
             }
         )
         env.pop("CODEX_HOME", None)
         env.pop("CLAUDE_CONFIG_DIR", None)
-        if manifest.host == "claude":
+        env.pop("OPENCODE_HOME", None)
+        if manifest.host == "opencode":
+            isolated_home = _provision_opencode_home(
+                attempt_root,
+                arm=execution.arm,
+                python_executable=manifest.python_executable,
+                state=state,
+                workspace=workspace,
+            )
+            env["OPENCODE_HOME"] = str(isolated_home)
+        elif manifest.host == "claude":
             isolated_home = _provision_claude_config(
                 attempt_root,
                 arm=execution.arm,
@@ -1005,7 +1051,7 @@ def _run_attempt(
             argv=_attempt_argv(manifest, state=state, arm=execution.arm, prompt=prompt),
             cwd=workspace,
             env=env,
-            stdin="" if manifest.host == "agy" else prompt,
+            stdin="" if manifest.host in {"agy", "opencode"} else prompt,
             timeout_seconds=manifest.timeout_seconds,
             isolated_home=isolated_home,
         )
@@ -1015,7 +1061,10 @@ def _run_attempt(
         (artifacts / "stderr.log").write_text(output.stderr, encoding="utf-8", newline="\n")
         if output.returncode != 0:
             raise RuntimeError(f"Codex exited with status {output.returncode}")
-        if manifest.host == "claude":
+        if manifest.host == "opencode":
+            protocol = parse_opencode_exec_json(output.stdout)
+            _write_opencode_answer(output.stdout, artifacts / "answer.json")
+        elif manifest.host == "claude":
             protocol = parse_claude_exec_json(output.stdout)
             _write_claude_answer(output.stdout, artifacts / "answer.json")
         elif manifest.host == "agy":
@@ -1034,6 +1083,8 @@ def _run_attempt(
             _validate_mcp_read_trace(output.stdout, scenario)
         elif manifest.host == "agy" and manifest.path == "mcp":
             _validate_agy_read_trace(output.stdout, scenario)
+        elif manifest.host == "opencode" and manifest.path == "mcp":
+            _validate_opencode_read_trace(output.stdout, scenario)
         _validate_answer(artifacts / "answer.json", execution.scenario_id, expected_answers)
         return AttemptRecord(
             attempt_number=attempt_number,
@@ -1066,9 +1117,10 @@ def _attempt_argv(
 ) -> tuple[str, ...]:
     """Add per-attempt host settings that cannot live in the manifest argv."""
 
+    if manifest.host == "opencode":
+        return (*manifest.argv, "--prompt", prompt)
+
     if manifest.host == "agy":
-        # agy does not consume a plain-text stdin prompt in print mode; its
-        # public CLI requires the prompt as the --prompt option.
         return (*manifest.argv, "--prompt", prompt)
 
     if manifest.host != "codex" or manifest.path != "mcp":
@@ -1147,6 +1199,54 @@ def _write_agy_answer(stdout: str, destination: Path) -> None:
     destination.write_text(_extract_json_object(answer), encoding="utf-8", newline="\n")
 
 
+def _write_opencode_answer(stdout: str, destination: Path) -> None:
+    """Extract OpenCode's final response from its NDJSON result event."""
+
+    result: Mapping[str, object] | None = None
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if isinstance(event, dict) and event.get("event") == "result":
+            value = event.get("result")
+            if isinstance(value, dict):
+                result = value
+    if result is None:
+        raise RuntimeError("opencode stream did not contain a result event")
+    structured_output = result.get("structured_output")
+    if isinstance(structured_output, dict):
+        destination.write_text(
+            json.dumps(structured_output, sort_keys=True), encoding="utf-8", newline="\n"
+        )
+        return
+    answer = result.get("response")
+    if not isinstance(answer, str):
+        raise RuntimeError("opencode result did not contain a final response")
+    destination.write_text(_extract_json_object(answer), encoding="utf-8", newline="\n")
+
+
+def _provision_opencode_home(
+    attempt_root: Path,
+    *,
+    arm: Arm,
+    python_executable: str,
+    state: Path,
+    workspace: Path,
+) -> Path:
+    """Create an isolated OPENCODE_HOME carrying only the htsave plugin."""
+
+    home = attempt_root / "opencode-home"
+    home.mkdir()
+    if os.name != "nt":
+        home.chmod(0o700)
+    if arm == "treatment":
+        install_opencode_integration(
+            project_dir=workspace,
+            python_executable=Path(python_executable),
+        )
+    return home
+
+
 def _provision_claude_config(attempt_root: Path, *, arm: Arm, python_executable: str) -> Path:
     """Create the isolated CLAUDE_CONFIG_DIR that carries this attempt's arm.
 
@@ -1162,7 +1262,7 @@ def _provision_claude_config(attempt_root: Path, *, arm: Arm, python_executable:
         home.chmod(0o700)
     settings = home / "settings.json"
     if arm == "treatment":
-        install_claude_integration(
+        install_claude_hooks(
             settings_path=settings,
             python_executable=Path(python_executable),
         )
@@ -1228,6 +1328,7 @@ _CREDENTIAL_FILES: dict[str, tuple[str, str]] = {
     "codex-home": ("CODEX_HOME", "auth.json"),
     "claude-config": ("CLAUDE_CONFIG_DIR", ".credentials.json"),
     "agy-home": ("HOME", ".gemini/antigravity-cli/antigravity-oauth-token"),
+    "opencode-home": ("OPENCODE_HOME", ".opencode/credentials.json"),
 }
 
 
@@ -1242,6 +1343,8 @@ def _install_host_credentials(home: Path) -> None:
         default = Path.home() / ".codex"
     elif variable == "CLAUDE_CONFIG_DIR":
         default = Path.home() / ".claude"
+    elif variable == "OPENCODE_HOME":
+        default = Path.home()
     else:
         default = Path.home()
     source = Path(os.environ.get(variable) or default)
@@ -1412,6 +1515,38 @@ def _validate_agy_read_trace(payload: str, scenario: Mapping[str, object]) -> No
         )
 
 
+def _validate_opencode_read_trace(payload: str, scenario: Mapping[str, object]) -> None:
+    """Require OpenCode's NDJSON MCP calls to match the prescribed read order."""
+
+    emit_paths = scenario.get("emit_paths")
+    if not isinstance(emit_paths, list) or not all(
+        isinstance(path, str) for path in emit_paths
+    ):
+        raise RuntimeError("fixture is missing valid opencode emit paths")
+    expected = tuple(path for _ in range(_ROUNDS) for path in emit_paths)
+    observed: list[str] = []
+    for line in payload.splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if not isinstance(event, dict) or event.get("event") != "tool_call":
+            continue
+        tool = event.get("tool")
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("name") != "htsave_read":
+            continue
+        arguments = tool.get("arguments")
+        if not isinstance(arguments, dict) or not isinstance(arguments.get("path"), str):
+            raise RuntimeError("opencode htsave_read trace contains an invalid path")
+        observed.append(arguments["path"])
+    if tuple(observed) != expected:
+        raise RuntimeError(
+            "opencode htsave_read trace does not match the prescribed read order: "
+            f"expected {list(expected)}, observed {observed}"
+        )
+
+
 def _next_attempt_number(output_dir: Path, execution: ExecutionSpec) -> int:
     execution_root = output_dir / "runs" / execution.execution_id
     existing = [
@@ -1432,18 +1567,7 @@ def _execution_id(scenario_id: str, pair_index: int, arm: Arm) -> str:
 
 
 def _write_manifest(path: Path, manifest: ReleaseManifest) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
-    if os.name != "nt":
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+    atomic_write_text(path, json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n")
 
 
 def _write_json(path: Path, value: object) -> None:

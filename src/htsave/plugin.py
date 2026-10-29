@@ -17,7 +17,7 @@ from typing import Any, Protocol
 
 from . import __version__
 from .errors import HtsaveError, SecurityBoundaryError
-from .paths import default_state_root, ensure_private_directory
+from .paths import atomic_write_text, default_state_root, ensure_private_directory
 
 PLUGIN_NAME = "htsave"
 MARKETPLACE_NAME = "htsave-local"
@@ -156,23 +156,7 @@ def _require_owned(root: Path) -> None:
 
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(payload, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        if os.name != "nt":
-            os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n", mode=0o600)
 
 
 def _secure_tree(root: Path) -> None:
