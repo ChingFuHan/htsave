@@ -18,6 +18,7 @@ from htsave.plugin import (
     MCP_MODULE,
     PLUGIN_NAME,
     PLUGIN_SELECTOR,
+    SKILL_MARKER,
     CodexPluginManager,
     PluginDrift,
     PluginIntegrationError,
@@ -28,6 +29,15 @@ from htsave.plugin import (
 )
 
 TEMPLATE_ROOT = Path(__file__).resolve().parents[1] / "plugin" / "htsave"
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch) -> Path:
+    # Installs write the Codex user skill under the home directory.
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
 
 
 class FakeCodex:
@@ -237,6 +247,9 @@ def test_materialize_renders_direct_mcp_hooks_marketplace_and_ownership(tmp_path
     assert manifest["name"] == PLUGIN_NAME
     assert manifest["version"] == "1.2.3"
     assert "hooks" not in manifest  # default hooks/hooks.json discovery
+    # Skills install as a user skill; the template also holds agy/OpenCode variants.
+    assert "skills" not in manifest
+    assert not (paths.plugin_root / "skills").exists()
 
     mcp = json.loads((paths.plugin_root / ".mcp.json").read_text(encoding="utf-8"))
     assert set(mcp) == {PLUGIN_NAME}  # Runtime direct-map contract, not stale wrapper validation.
@@ -526,3 +539,71 @@ def test_failed_codex_json_is_observable_without_writing_config(tmp_path) -> Non
     with pytest.raises(PluginIntegrationError, match="config unavailable"):
         manager.install()
     assert not manager.paths.marketplace_root.exists()
+
+
+def _skill_manager(tmp_path: Path, fake: FakeCodex) -> CodexPluginManager:
+    return CodexPluginManager(
+        state_root=tmp_path / "state",
+        template_root=TEMPLATE_ROOT,
+        python_executable=fake.python_executable,
+        package_version="1.2.3",
+        runner=fake,
+    )
+
+
+def test_install_writes_owned_user_skill_for_plain_dollar_invocation(
+    tmp_path, isolated_home
+) -> None:
+    manager = _skill_manager(tmp_path, FakeCodex(runtime_python(tmp_path)))
+
+    status = manager.install()
+
+    skill = isolated_home / ".agents" / "skills" / "htsave" / "SKILL.md"
+    assert manager.skill_path == skill
+    content = skill.read_text(encoding="utf-8")
+    template = (TEMPLATE_ROOT / "skills" / "htsave" / "SKILL.md").read_text(encoding="utf-8")
+    assert content == template.rstrip() + "\n\n" + SKILL_MARKER + "\n"
+    assert content.startswith("---\nname: htsave\n")
+    assert status.healthy
+
+
+def test_status_reports_missing_and_edited_skill(tmp_path) -> None:
+    manager = _skill_manager(tmp_path, FakeCodex(runtime_python(tmp_path)))
+    manager.install()
+
+    manager.skill_path.write_text("edited\n" + SKILL_MARKER, encoding="utf-8")
+    assert manager.status().drifts == (PluginDrift.SKILL_MISMATCH,)
+
+    manager.skill_path.unlink()
+    status = manager.status()
+    assert status.state is PluginState.DRIFTED
+    assert status.drifts == (PluginDrift.SKILL_MISSING,)
+
+    assert manager.install().healthy
+
+
+def test_install_refuses_unowned_skill_before_touching_codex(tmp_path) -> None:
+    fake = FakeCodex(runtime_python(tmp_path))
+    manager = _skill_manager(tmp_path, fake)
+    manager.skill_path.parent.mkdir(parents=True)
+    manager.skill_path.write_text("someone else's htsave skill", encoding="utf-8")
+
+    with pytest.raises(PluginOwnershipError, match="unowned skill"):
+        manager.install()
+
+    assert fake.calls == []
+    assert not manager.paths.marketplace_root.exists()
+    assert manager.skill_path.read_text(encoding="utf-8") == "someone else's htsave skill"
+
+
+def test_uninstall_removes_owned_skill_and_keeps_foreign_one(tmp_path) -> None:
+    manager = _skill_manager(tmp_path, FakeCodex(runtime_python(tmp_path)))
+    manager.install()
+
+    manager.uninstall()
+    assert not manager.skill_path.parent.exists()
+
+    manager.skill_path.parent.mkdir(parents=True)
+    manager.skill_path.write_text("foreign", encoding="utf-8")
+    manager.uninstall()
+    assert manager.skill_path.read_text(encoding="utf-8") == "foreign"

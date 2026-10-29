@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shlex
@@ -25,6 +26,10 @@ PLUGIN_SELECTOR = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
 OWNERSHIP_FILE = ".htsave-owned.json"
 MCP_MODULE = "htsave.mcp_server"
 HOOK_MODULE = "htsave.codex_hooks"
+# Codex namespaces plugin skills (``$htsave:htsave``); a user skill in
+# ``~/.agents/skills`` is invoked as plain ``$htsave``, like caveman's.
+CODEX_SKILL_RELATIVE = Path(".agents") / "skills" / PLUGIN_NAME / "SKILL.md"
+SKILL_MARKER = "<!-- htsaveOwned: codex-skill-v1 -->"
 _MCP_RUNTIME_IMPORT = "import htsave.mcp_server"
 _MCP_RUNTIME_TIMEOUT_SECONDS = 5
 
@@ -70,6 +75,8 @@ class PluginDrift(StrEnum):
     MCP_COMMAND = "mcp-command-mismatch"
     MCP_ARGS = "mcp-args-mismatch"
     MCP_RUNTIME = "mcp-runtime-unavailable"
+    SKILL_MISSING = "skill-missing"
+    SKILL_MISMATCH = "skill-mismatch"
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,7 +272,13 @@ def _render_plugin_tree(
         raise PluginIntegrationError("plugin template must not contain symbolic links")
 
     plugin_root = stage / "plugins" / PLUGIN_NAME
-    shutil.copytree(template_root, plugin_root)
+    # Skills are installed as a user skill instead; the template's skills/
+    # directory also holds the agy and OpenCode variants, which Codex must not load.
+    shutil.copytree(
+        template_root,
+        plugin_root,
+        ignore=lambda directory, _names: ["skills"] if Path(directory) == template_root else [],
+    )
 
     manifest_path = plugin_root / ".codex-plugin" / "plugin.json"
     manifest = _read_json(manifest_path)
@@ -306,6 +319,24 @@ def _render_plugin_tree(
     _write_json(stage / ".agents" / "plugins" / "marketplace.json", marketplace)
     _write_json(stage / OWNERSHIP_FILE, _ownership_payload())
     _secure_tree(stage)
+
+
+def render_codex_skill(template_root: Path | None = None) -> str:
+    """Return the Codex user skill: the packaged template plus an ownership marker."""
+
+    path = (template_root or default_template_root()) / "skills" / PLUGIN_NAME / "SKILL.md"
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise PluginIntegrationError(f"Codex skill template is missing: {path}") from error
+    return content.rstrip() + "\n\n" + SKILL_MARKER + "\n"
+
+
+def _skill_is_owned(path: Path) -> bool:
+    try:
+        return SKILL_MARKER in path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
 
 
 def _recover_interrupted_swap(root: Path) -> None:
@@ -478,8 +509,10 @@ class CodexPluginManager:
         package_version: str = __version__,
         runner: Runner | None = None,
         codex_executable: str = "codex",
+        home: Path | None = None,
     ) -> None:
         self.paths = build_plugin_paths(state_root)
+        self.skill_path = (home or Path.home()) / CODEX_SKILL_RELATIVE
         self.template_root = template_root
         self.python_executable = _runtime_python_path(python_executable)
         self.package_version = package_version
@@ -501,6 +534,9 @@ class CodexPluginManager:
         return marketplace
 
     def install(self) -> PluginStatus:
+        if self.skill_path.exists() and not _skill_is_owned(self.skill_path):
+            raise PluginOwnershipError(f"refusing to replace unowned skill: {self.skill_path}")
+        skill = render_codex_skill(self.template_root)
         marketplaces = self.client.marketplaces()
         self._assert_no_marketplace_conflict(marketplaces)
         materialize_plugin(
@@ -511,6 +547,8 @@ class CodexPluginManager:
         )
         self.client.add_marketplace(self.paths.marketplace_root)
         self.client.add_plugin()
+        self.skill_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(self.skill_path, skill, mode=0o644)
         status = self.status()
         if not status.healthy:
             raise PluginIntegrationError(
@@ -569,6 +607,19 @@ class CodexPluginManager:
         except (PluginIntegrationError, KeyError, TypeError):
             drifts.append(PluginDrift.MATERIALIZED_HOOKS)
         return drifts
+
+    def _skill_drifts(self) -> list[PluginDrift]:
+        try:
+            content = self.skill_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return [PluginDrift.SKILL_MISSING]
+        except (OSError, UnicodeDecodeError):
+            return [PluginDrift.SKILL_MISMATCH]
+        try:
+            expected = render_codex_skill(self.template_root)
+        except PluginIntegrationError:
+            return [PluginDrift.SKILL_MISMATCH]
+        return [] if content == expected else [PluginDrift.SKILL_MISMATCH]
 
     def status(self) -> PluginStatus:
         local_drifts = self._materialized_drifts()
@@ -640,6 +691,7 @@ class CodexPluginManager:
                     drifts.append(PluginDrift.MCP_ARGS)
                 if command_matches and not _mcp_runtime_importable(self.python_executable):
                     drifts.append(PluginDrift.MCP_RUNTIME)
+            drifts.extend(self._skill_drifts())
 
         unique_drifts = tuple(dict.fromkeys(drifts))
         if conflict or PluginDrift.OWNERSHIP_MISMATCH in unique_drifts:
@@ -684,13 +736,20 @@ class CodexPluginManager:
             self.client.remove_marketplace()
         if self.paths.marketplace_root.exists():
             shutil.rmtree(self.paths.marketplace_root)
+        if _skill_is_owned(self.skill_path):
+            self.skill_path.unlink()
+            # Not empty: keep files htsave does not own.
+            with contextlib.suppress(OSError):
+                self.skill_path.parent.rmdir()
         return self.status()
 
 
 __all__ = [
+    "CODEX_SKILL_RELATIVE",
     "MARKETPLACE_NAME",
     "PLUGIN_NAME",
     "PLUGIN_SELECTOR",
+    "SKILL_MARKER",
     "CodexClient",
     "CodexPluginManager",
     "PluginDrift",
@@ -702,4 +761,5 @@ __all__ = [
     "build_plugin_paths",
     "default_template_root",
     "materialize_plugin",
+    "render_codex_skill",
 ]

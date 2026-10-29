@@ -95,7 +95,7 @@ Python 3.11+ is supported on Linux, macOS, and Windows:
 uv tool install htsave   # runtime: htsave, htsave-claude-hook, htsave-mcp on PATH
 
 htsave claude install    # Claude Code: the htsave plugin from its marketplace
-htsave codex install     # Codex CLI: managed plugin marketplace
+htsave codex install     # Codex CLI: managed plugin marketplace + $htsave skill in ~/.agents/skills/
 htsave agy install       # Antigravity CLI: skill + MCP + hooks in ~/.gemini/config/
 htsave doctor
 ```

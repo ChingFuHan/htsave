@@ -84,7 +84,8 @@ Codex lifecycle hooks        htsave MCP tools          htsave CLI
 - `compat` owns host detection and what each host's contract permits.
 - `mcp_server` owns workspace path authorization and explicit read/hydrate
   results.
-- `plugin` (Codex marketplace), `claude_install` (the Claude Code plugin in
+- `plugin` (Codex marketplace for hooks and MCP, plus the `$htsave` user skill
+  in `~/.agents/skills/htsave`), `claude_install` (the Claude Code plugin in
   `plugin/claude-code`, installed through `claude plugin`), `agy_install`
   (Antigravity `~/.gemini/config/`), and `opencode_install` (OpenCode
   `.opencode/plugins/`) own installation, and `cli` owns operator actions. They

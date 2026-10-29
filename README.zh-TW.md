@@ -92,7 +92,7 @@ OpenCode CLI 仍屬實驗性功能。`htsave opencode install` 可用於本地�
 uv tool install htsave   # runtime：將 htsave、htsave-claude-hook、htsave-mcp 放上 PATH
 
 htsave claude install    # Claude Code：從 marketplace 安裝 htsave 外掛
-htsave codex install     # Codex CLI：透過 managed plugin marketplace 安裝
+htsave codex install     # Codex CLI：managed plugin marketplace + ~/.agents/skills/ 的 $htsave skill
 htsave agy install       # Antigravity CLI：將 skill + MCP + hooks 安裝至 ~/.gemini/config/
 htsave doctor
 ```
